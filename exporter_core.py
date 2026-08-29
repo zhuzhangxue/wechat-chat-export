@@ -13,7 +13,7 @@ import xml.etree.ElementTree as ET
 import zstandard as zstd
 from wechatauto import WeChatDB
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.2"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 TYPE_LABEL = {
