@@ -1,0 +1,16 @@
+exports/
+final_export/
+**/keys.json
+wechatauto_db/
+*.sqlite
+*.sqlite3
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+*.spec
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
