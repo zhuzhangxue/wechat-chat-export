@@ -12,7 +12,8 @@ from tkinter import filedialog, messagebox, ttk
 
 import psutil
 
-from exporter_core import export_chat
+from exporter_core import export_chat, install_local_asr_model, local_asr_status
+from preview import open_chat_preview
 
 APP_TITLE = "微信聊天导出给大模型"
 WECHAT_PROCESS_NAMES = {"weixin.exe", "wechat.exe"}
@@ -44,8 +45,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("840x650")
-        self.minsize(760, 560)
+        self.geometry("920x680")
+        self.minsize(820, 580)
 
         try:
             icon_bytes = base64.b64decode(WINDOW_ICON_PNG_BASE64)
@@ -56,6 +57,7 @@ class App(tk.Tk):
 
         self.q = queue.Queue()
         self.last_output = None
+        self.last_result = None
 
         pad = ttk.Frame(self, padding=18)
         pad.grid(row=0, column=0, sticky="nsew")
@@ -63,7 +65,7 @@ class App(tk.Tk):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
         pad.grid_columnconfigure(0, weight=1)
-        pad.grid_rowconfigure(7, weight=1)
+        pad.grid_rowconfigure(8, weight=1)
 
         ttk.Label(
             pad,
@@ -108,23 +110,40 @@ class App(tk.Tk):
         ttk.Button(outrow, text="选择", command=self.choose_out).grid(row=0, column=2)
 
         media_row = ttk.Frame(pad)
-        media_row.grid(row=5, column=0, sticky="ew", pady=(2, 6))
+        media_row.grid(row=5, column=0, sticky="ew", pady=(2, 2))
         ttk.Label(media_row, text="附带导出：").pack(side="left")
 
         self.images_var = tk.BooleanVar(value=True)
         self.files_var = tk.BooleanVar(value=True)
+        self.voices_var = tk.BooleanVar(value=False)
+        self.videos_var = tk.BooleanVar(value=False)
+        self.transcribe_var = tk.BooleanVar(value=False)
+
         ttk.Checkbutton(
             media_row, text="图片", variable=self.images_var
         ).pack(side="left", padx=(6, 8))
         ttk.Checkbutton(
             media_row, text="文件", variable=self.files_var
-        ).pack(side="left", padx=(0, 10))
-        ttk.Label(
+        ).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(
+            media_row, text="语音", variable=self.voices_var
+        ).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(
+            media_row, text="视频", variable=self.videos_var
+        ).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(
             media_row,
-            text="仅导出微信本机仍有缓存的内容；Markdown 可直接预览图片、点击文件。",
-        ).pack(side="left")
+            text="语音转文字（本地）",
+            variable=self.transcribe_var,
+            command=self.on_transcribe_toggle,
+        ).pack(side="left", padx=(0, 8))
 
-        ttk.Separator(pad).grid(row=6, column=0, sticky="ew", pady=10)
+        ttk.Label(
+            pad,
+            text="仅导出本机仍有缓存的附件；“语音转文字（本地）”默认关闭，勾选后会自动同时导出语音。",
+        ).grid(row=6, column=0, sticky="w", pady=(2, 4))
+
+        ttk.Separator(pad).grid(row=7, column=0, sticky="ew", pady=10)
 
         self.status = tk.Text(
             pad,
@@ -132,11 +151,19 @@ class App(tk.Tk):
             wrap="word",
             state="disabled",
         )
-        self.status.grid(row=7, column=0, sticky="nsew")
+        self.status.grid(row=8, column=0, sticky="nsew")
 
         bottom = ttk.Frame(pad)
-        bottom.grid(row=8, column=0, sticky="ew", pady=(10, 0))
+        bottom.grid(row=9, column=0, sticky="ew", pady=(10, 0))
         bottom.grid_columnconfigure(0, weight=1)
+
+        self.preview_btn = ttk.Button(
+            bottom,
+            text="打开聊天预览",
+            command=self.open_preview,
+            state="disabled",
+        )
+        self.preview_btn.grid(row=0, column=1, sticky="e", padx=(0, 8))
 
         self.open_btn = ttk.Button(
             bottom,
@@ -144,10 +171,14 @@ class App(tk.Tk):
             command=self.open_output,
             state="disabled",
         )
-        self.open_btn.grid(row=0, column=1, sticky="e")
+        self.open_btn.grid(row=0, column=2, sticky="e")
 
         self.entry.focus_set()
         self.after(100, self.poll_queue)
+
+    def on_transcribe_toggle(self):
+        if self.transcribe_var.get():
+            self.voices_var.set(True)
 
     def choose_out(self):
         path = filedialog.askdirectory(
@@ -177,9 +208,44 @@ class App(tk.Tk):
             )
             return
 
+        transcribe_voices = self.transcribe_var.get()
+        if transcribe_voices:
+            self.voices_var.set(True)
+            ok, reason = local_asr_status()
+            if not ok:
+                if reason.startswith("本地语音识别运行库不可用"):
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "当前程序缺少本地语音识别运行库。\n\n"
+                        "如果你使用的是 GitHub 发布的 Windows 版，请重新下载最新构建；"
+                        "如果从源码运行，请先安装 requirements.txt。\n\n"
+                        f"详细信息：{reason}",
+                    )
+                    return
+
+                install_now = messagebox.askyesno(
+                    APP_TITLE,
+                    "本地语音识别模型还没有安装。\n\n"
+                    "需要从 sherpa-onnx 官方 GitHub Release 下载约 230 MB 的 "
+                    "SenseVoice Small Int8 模型。\n"
+                    "模型只下载一次，之后识别在本机完成，不上传聊天语音。\n\n"
+                    "现在下载并安装吗？",
+                )
+                if install_now:
+                    self.export_btn.configure(state="disabled")
+                    self.log("")
+                    self.log("开始安装本地语音识别模型…")
+                    threading.Thread(
+                        target=self.install_asr_worker,
+                        daemon=True,
+                    ).start()
+                return
+
         self.export_btn.configure(state="disabled")
         self.open_btn.configure(state="disabled")
+        self.preview_btn.configure(state="disabled")
         self.last_output = None
+        self.last_result = None
         self.log("")
         self.log(f"开始导出：{name}")
 
@@ -190,12 +256,33 @@ class App(tk.Tk):
                 self.out_var.get().strip() or str(app_dir() / "exports"),
                 self.images_var.get(),
                 self.files_var.get(),
+                self.voices_var.get(),
+                self.videos_var.get(),
+                transcribe_voices,
             ),
             daemon=True,
         )
         thread.start()
 
-    def worker(self, name, outdir, export_images, export_files):
+    def install_asr_worker(self):
+        try:
+            install_local_asr_model(
+                progress=lambda m: self.q.put(("log", m))
+            )
+            self.q.put(("asr_installed", None))
+        except Exception as exc:
+            self.q.put(("asr_error", f"{type(exc).__name__}: {exc}"))
+
+    def worker(
+        self,
+        name,
+        outdir,
+        export_images,
+        export_files,
+        export_voices,
+        export_videos,
+        transcribe_voices,
+    ):
         try:
             result = export_chat(
                 name,
@@ -203,6 +290,9 @@ class App(tk.Tk):
                 progress=lambda m: self.q.put(("log", m)),
                 export_images=export_images,
                 export_files=export_files,
+                export_voices=export_voices,
+                export_videos=export_videos,
+                transcribe_voices=transcribe_voices,
             )
             self.q.put(("done", result))
         except Exception as e:
@@ -216,9 +306,11 @@ class App(tk.Tk):
                     self.log(payload)
                 elif kind == "done":
                     self.last_output = payload["output_dir"]
+                    self.last_result = payload
                     self.log(f"输出：{payload['output_dir']}")
                     self.export_btn.configure(state="normal")
                     self.open_btn.configure(state="normal")
+                    self.preview_btn.configure(state="normal")
 
                     stats = payload.get("media_stats") or {}
                     media_line = (
@@ -226,6 +318,15 @@ class App(tk.Tk):
                         f"{stats.get('images_requested', 0)}"
                         f"\n文件：{stats.get('files_exported', 0)}/"
                         f"{stats.get('files_requested', 0)}"
+                        f"\n语音：{stats.get('voices_exported', 0)}/"
+                        f"{stats.get('voices_requested', 0)}"
+                        f"（WAV {stats.get('voices_decoded', 0)}）"
+                        f"\n语音转文字：{stats.get('voice_transcripts', 0)}/"
+                        f"{stats.get('voices_requested', 0)}"
+                        f"（本地 {stats.get('voice_transcripts_local', 0)}，"
+                        f"缓存 {stats.get('voice_transcripts_cached', 0)}）"
+                        f"\n视频：{stats.get('videos_exported', 0)}/"
+                        f"{stats.get('videos_requested', 0)}"
                     )
 
                     messagebox.showinfo(
@@ -236,6 +337,21 @@ class App(tk.Tk):
                         f"会话：{payload['chat_name']}"
                         f"{media_line}\n\n"
                         "已生成 TXT、Markdown 和 JSON。",
+                    )
+                elif kind == "asr_installed":
+                    self.export_btn.configure(state="normal")
+                    self.log("本地语音识别模型安装完成。")
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        "本地语音识别模型安装完成。\n\n"
+                        "现在可以重新点击“开始导出”。",
+                    )
+                elif kind == "asr_error":
+                    self.export_btn.configure(state="normal")
+                    self.log("本地语音识别模型安装失败：" + payload)
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "本地语音识别模型安装失败：\n\n" + payload,
                     )
                 elif kind == "error":
                     self.export_btn.configure(state="normal")
@@ -248,6 +364,13 @@ class App(tk.Tk):
             pass
 
         self.after(100, self.poll_queue)
+
+    def open_preview(self):
+        if not self.last_result:
+            return
+        json_path = self.last_result.get("json")
+        if json_path:
+            open_chat_preview(self, json_path)
 
     def open_output(self):
         if not self.last_output:

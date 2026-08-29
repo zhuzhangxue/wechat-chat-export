@@ -1,0 +1,7 @@
+zstandard
+Pillow
+psutil
+imageio-ffmpeg
+sherpa-onnx==1.13.6
+soundfile>=0.12,<1
+https://github.com/fanyuantaier/wechatauto-replica/archive/04ef8cbde3862cff90b5f6b42c9ebfcea44ef48d.zip

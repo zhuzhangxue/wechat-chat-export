@@ -10,7 +10,10 @@ import re
 import shutil
 import tempfile
 import subprocess
+import sys
+import tarfile
 import unicodedata
+import urllib.request
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +24,7 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 TYPE_LABEL = {
@@ -330,7 +333,7 @@ def load_rows(db: WeChatDB, username: str):
             cols = table_columns(conn, table)
             wanted = [
                 "local_id", "local_type", "server_id", "real_sender_id",
-                "create_time", "message_content", "compress_content",
+                "create_time", "message_content", "source", "compress_content",
                 "packed_info_data", "sort_seq",
             ]
             select_cols = [c for c in wanted if c in cols]
@@ -1112,11 +1115,550 @@ def _copy_file_from_row(
 
 
 def _media_label(media: dict) -> str:
-    if media.get("kind") == "image":
-        return "图片"
-    if media.get("kind") == "file":
-        return "文件"
-    return "附件"
+    return {
+        "image": "图片",
+        "file": "文件",
+        "voice": "语音",
+        "video": "视频",
+    }.get(media.get("kind"), "附件")
+
+
+def _voice_transcript(row: dict) -> str:
+    """读取微信本机已存在的语音转文字。
+
+    微信 4.x 不同小版本/消息形态可能把转写放在 message_content、
+    source、compress_content 或 packed_info_data 中，因此这里统一扫描。
+    """
+    values = (
+        row.get("message_content"),
+        row.get("source"),
+        row.get("compress_content"),
+        row.get("packed_info_data"),
+    )
+
+    for value in values:
+        if value in (None, b"", ""):
+            continue
+
+        candidates = []
+        decoded = decode_blob(value)
+        if decoded:
+            candidates.append(decoded)
+            unescaped = html.unescape(decoded)
+            if unescaped != decoded:
+                candidates.append(unescaped)
+
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            raw_text = bytes(value).decode("utf-8", errors="ignore").replace("\x00", "")
+            if raw_text and raw_text not in candidates:
+                candidates.append(raw_text)
+
+        for text_value in candidates:
+            if not text_value:
+                continue
+
+            # 标准 XML: <voicetrans transtext="..." ... />
+            if "voicetrans" in text_value.lower():
+                root = xml_root(text_value)
+                if root is not None:
+                    node = root.find(".//voicetrans")
+                    if node is not None:
+                        transcript = clean_text(
+                            node.get("transtext")
+                            or node.get("text")
+                            or node.text
+                            or ""
+                        )
+                        if transcript:
+                            return transcript
+
+            patterns = (
+                r'transtext\s*=\s*["\'](.*?)["\']',
+                r'"transtext"\s*:\s*"((?:\\.|[^"])*)"',
+                r"'transtext'\s*:\s*'((?:\\.|[^'])*)'",
+                r'voice[_-]?trans(?:cript|text)\s*[:=]\s*["\'](.*?)["\']',
+            )
+            for pattern in patterns:
+                hit = re.search(pattern, text_value, re.I | re.S)
+                if not hit:
+                    continue
+                transcript = hit.group(1)
+                try:
+                    transcript = bytes(transcript, "utf-8").decode("unicode_escape")
+                except Exception:
+                    pass
+                transcript = clean_text(transcript)
+                if transcript:
+                    return transcript
+
+    return ""
+
+
+def _voice_data_from_row(db: WeChatDB, username: str, row: dict):
+    server_id = row.get("server_id")
+    local_id = row.get("local_id")
+    create_time = _normalize_timestamp(row.get("create_time"))
+
+    for item in getattr(db, "_db_files", []):
+        if len(item) < 2:
+            continue
+        rel, path = item[0], item[1]
+        if not Path(path).name.lower().startswith("media_"):
+            continue
+        conn = db._open(rel)
+        try:
+            has_name = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Name2Id'"
+            ).fetchone()
+            has_voice = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='VoiceInfo'"
+            ).fetchone()
+            if not has_name or not has_voice:
+                continue
+            cid = conn.execute(
+                "SELECT rowid FROM Name2Id WHERE user_name=? LIMIT 1", (username,)
+            ).fetchone()
+            if not cid:
+                continue
+            chat_id = cid[0]
+            cols = table_columns(conn, "VoiceInfo")
+            attempts = []
+            if server_id not in (None, "") and "svr_id" in cols:
+                attempts.append(("chat_name_id=? AND svr_id=?", [chat_id, server_id]))
+            if local_id not in (None, "") and "local_id" in cols:
+                attempts.append(("chat_name_id=? AND local_id=?", [chat_id, local_id]))
+            if create_time and "create_time" in cols:
+                attempts.append(("chat_name_id=? AND create_time=?", [chat_id, create_time]))
+            for where, params in attempts:
+                found = conn.execute(
+                    f"SELECT voice_data FROM VoiceInfo WHERE {where} "
+                    "AND voice_data IS NOT NULL LIMIT 1",
+                    params,
+                ).fetchone()
+                if found and found[0]:
+                    return bytes(found[0]), None
+        except Exception:
+            continue
+        finally:
+            conn.close()
+    return None, "media_*.db 中没有匹配到 VoiceInfo.voice_data"
+
+
+def _runtime_resource(*parts) -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).resolve().parent
+    return base.joinpath(*parts)
+
+
+def _find_rust_silk() -> Path | None:
+    candidates = [
+        _runtime_resource("tools", "rust-silk.exe"),
+        Path(__file__).resolve().parent / "tools" / "rust-silk.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    found = shutil.which("rust-silk")
+    return Path(found) if found else None
+
+
+def _decode_silk_to_wav(silk_path: Path, wav_path: Path):
+    exe = _find_rust_silk()
+    if exe is None:
+        return False, "未找到 rust-silk 解码器；已保留原始 SILK"
+    try:
+        result = subprocess.run(
+            [
+                str(exe), "decode",
+                "-i", str(silk_path),
+                "-o", str(wav_path),
+                "--tolerant", "skip",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            **_subprocess_no_window(),
+        )
+    except Exception as exc:
+        return False, f"rust-silk 启动失败：{type(exc).__name__}: {exc}"
+    if result.returncode == 0 and wav_path.exists() and wav_path.stat().st_size > 44:
+        return True, None
+    err = result.stderr.decode("utf-8", "ignore").strip()
+    return False, f"SILK→WAV 失败：{err[:300] or '未知错误'}"
+
+
+def _write_voice_from_row(db, row, username, voice_dir: Path):
+    data, reason = _voice_data_from_row(db, username, row)
+    transcript = _voice_transcript(row)
+    if not data:
+        return None, reason, transcript
+
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    seq = row.get("sort_seq") or row.get("local_id") or "voice"
+    lid = row.get("local_id") or "0"
+    silk_path = voice_dir / f"{seq}_{lid}.silk"
+    try:
+        silk_path.write_bytes(data)
+    except OSError as exc:
+        return None, f"写入 SILK 失败：{exc}", transcript
+
+    wav_path = voice_dir / f"{seq}_{lid}.wav"
+    decoded, decode_reason = _decode_silk_to_wav(silk_path, wav_path)
+
+    # 对普通用户只保留可直接播放的 WAV。
+    # SILK 仅在 WAV 解码失败时作为兜底保留。
+    if decoded:
+        try:
+            silk_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    media = {
+        "kind": "voice",
+        "path": str(wav_path if decoded else silk_path),
+        "silk_path": None if decoded else str(silk_path),
+        "format": "wav" if decoded else "silk",
+        "decoded": decoded,
+        "transcript": transcript,
+        "voice_sha256": hashlib.sha256(data).hexdigest(),
+        "previewable": False,
+    }
+    return media, decode_reason, transcript
+
+
+
+SENSEVOICE_MODEL_URL = (
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+    "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
+)
+SENSEVOICE_MODEL_SHA256 = "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"
+
+
+def _persistent_sensevoice_dir() -> Path:
+    """模型放在用户目录，避免 PyInstaller onefile 每次启动后丢失。"""
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        root = Path(local_appdata)
+    else:
+        root = Path.home() / ".wechat-chat-export-for-llm"
+    return root / "WeChat-Chat-Export-for-LLM" / "models" / "sensevoice"
+
+
+def _find_sensevoice_model():
+    """返回本地 SenseVoice 模型与 tokens 路径。"""
+    persistent = _persistent_sensevoice_dir()
+    candidates = [
+        (persistent / "model.int8.onnx", persistent / "tokens.txt"),
+        (
+            _runtime_resource("tools", "asr", "sensevoice", "model.int8.onnx"),
+            _runtime_resource("tools", "asr", "sensevoice", "tokens.txt"),
+        ),
+        (
+            Path(__file__).resolve().parent / "tools" / "asr" / "sensevoice" / "model.int8.onnx",
+            Path(__file__).resolve().parent / "tools" / "asr" / "sensevoice" / "tokens.txt",
+        ),
+    ]
+    for model, tokens in candidates:
+        if model.exists() and tokens.exists():
+            return model, tokens
+    return None, None
+
+
+def _local_asr_runtime_status():
+    try:
+        import sherpa_onnx  # noqa: F401
+        import soundfile  # noqa: F401
+    except Exception as exc:
+        return False, f"本地语音识别运行库不可用：{type(exc).__name__}: {exc}"
+    return True, ""
+
+
+def local_asr_status():
+    """供 GUI/CLI 在开始导出前检查本地语音识别。"""
+    ok, reason = _local_asr_runtime_status()
+    if not ok:
+        return False, reason
+    model, tokens = _find_sensevoice_model()
+    if not model or not tokens:
+        return False, "未安装 SenseVoice 本地语音识别模型"
+    return True, ""
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def install_local_asr_model(progress=None):
+    """显式下载并安装 SenseVoice Small Int8 模型。不会上传聊天内容。"""
+    def log(message):
+        if progress:
+            progress(message)
+
+    ok, reason = _local_asr_runtime_status()
+    if not ok:
+        raise RuntimeError(reason)
+
+    existing_model, existing_tokens = _find_sensevoice_model()
+    if existing_model and existing_tokens:
+        if _sha256_file(existing_model).lower() == SENSEVOICE_MODEL_SHA256:
+            log("SenseVoice 模型已经安装，无需重复下载。")
+            return str(existing_model)
+
+    target_dir = _persistent_sensevoice_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="wechat-chat-export-asr-") as td:
+        td = Path(td)
+        archive = td / "sensevoice.tar.bz2"
+        log("正在下载 SenseVoice Small Int8 模型（约 230 MB）…")
+
+        request = urllib.request.Request(
+            SENSEVOICE_MODEL_URL,
+            headers={"User-Agent": "WeChat-Chat-Export-for-LLM/1.3.0"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as f:
+            total = int(response.headers.get("Content-Length") or 0)
+            downloaded = 0
+            last_percent = -10
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if total:
+                    percent = int(downloaded * 100 / total)
+                    if percent >= last_percent + 10:
+                        last_percent = (percent // 10) * 10
+                        log(f"模型下载：{min(percent, 100)}%")
+
+        log("正在解压模型…")
+        model_tmp = td / "model.int8.onnx"
+        tokens_tmp = td / "tokens.txt"
+        license_tmp = td / "MODEL_LICENSE"
+        readme_tmp = td / "MODEL_README.md"
+
+        wanted = {
+            "model.int8.onnx": model_tmp,
+            "tokens.txt": tokens_tmp,
+            "LICENSE": license_tmp,
+            "README.md": readme_tmp,
+        }
+        found = set()
+        with tarfile.open(archive, "r:bz2") as tf:
+            for member in tf.getmembers():
+                name = Path(member.name).name
+                if name not in wanted or name in found or not member.isfile():
+                    continue
+                source = tf.extractfile(member)
+                if source is None:
+                    continue
+                with source, wanted[name].open("wb") as dst:
+                    shutil.copyfileobj(source, dst)
+                found.add(name)
+
+        if not model_tmp.exists() or not tokens_tmp.exists():
+            raise RuntimeError("下载的模型包缺少 model.int8.onnx 或 tokens.txt")
+
+        actual = _sha256_file(model_tmp).lower()
+        if actual != SENSEVOICE_MODEL_SHA256:
+            raise RuntimeError(
+                "SenseVoice 模型校验失败。"
+                f"\n预期 SHA-256：{SENSEVOICE_MODEL_SHA256}"
+                f"\n实际 SHA-256：{actual}"
+            )
+
+        log("模型校验通过，正在安装…")
+        for src_file, dest_name in (
+            (model_tmp, "model.int8.onnx"),
+            (tokens_tmp, "tokens.txt"),
+            (license_tmp, "MODEL_LICENSE"),
+            (readme_tmp, "MODEL_README.md"),
+        ):
+            if not src_file.exists():
+                continue
+            tmp_dest = target_dir / (dest_name + ".tmp")
+            shutil.copy2(src_file, tmp_dest)
+            os.replace(tmp_dest, target_dir / dest_name)
+
+    log("SenseVoice 本地语音识别模型安装完成。")
+    return str(target_dir / "model.int8.onnx")
+
+
+def _create_local_asr_recognizer():
+    ok, reason = local_asr_status()
+    if not ok:
+        raise RuntimeError(reason)
+
+    import sherpa_onnx
+
+    model, tokens = _find_sensevoice_model()
+    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
+        model=str(model),
+        tokens=str(tokens),
+        num_threads=4,
+        language="auto",
+        use_itn=True,
+        debug=False,
+        provider="cpu",
+    )
+
+
+def _asr_result_text(result) -> str:
+    text = getattr(result, "text", None)
+    if isinstance(text, str):
+        return clean_text(text)
+
+    if isinstance(result, str):
+        raw = result.strip()
+    else:
+        raw = str(result).strip()
+
+    if not raw:
+        return ""
+
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+            return clean_text(obj["text"])
+    except Exception:
+        pass
+
+    return clean_text(raw)
+
+
+def _transcribe_wav_local(recognizer, wav_path: Path):
+    try:
+        import soundfile as sf
+
+        audio, sample_rate = sf.read(
+            str(wav_path),
+            dtype="float32",
+            always_2d=True,
+        )
+        if len(audio) == 0:
+            return "", "WAV 没有音频采样"
+
+        # 微信语音通常是单声道；若遇到多声道则平均为单声道。
+        if audio.shape[1] == 1:
+            samples = audio[:, 0]
+        else:
+            samples = audio.mean(axis=1)
+
+        stream = recognizer.create_stream()
+        stream.accept_waveform(int(sample_rate), samples)
+        recognizer.decode_stream(stream)
+        text = _asr_result_text(stream.result)
+        if not text:
+            return "", "本地语音识别未返回文字"
+        return text, None
+    except Exception as exc:
+        return "", f"本地语音识别失败：{type(exc).__name__}: {exc}"
+
+
+def _load_asr_cache(out_root: Path):
+    path = out_root / ".voice_asr_cache.json"
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return path, {
+                    str(k): str(v)
+                    for k, v in data.items()
+                    if isinstance(k, str) and isinstance(v, str) and v.strip()
+                }
+    except Exception:
+        pass
+    return path, {}
+
+
+def _save_asr_cache(path: Path, cache: dict):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        # 缓存失败不能影响聊天导出本身。
+        pass
+
+
+def _extract_video_id(row: dict) -> str:
+    for value in (row.get("packed_info_data"), row.get("message_content")):
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            m = re.search(rb"([0-9a-fA-F]{32})", bytes(value))
+            if m:
+                return m.group(1).decode("ascii").lower()
+        elif isinstance(value, str):
+            m = re.search(r"([0-9a-fA-F]{32})", value)
+            if m:
+                return m.group(1).lower()
+    return ""
+
+
+def _index_video_files(db: WeChatDB):
+    account = Path(db.account_dir)
+    roots = [account / "msg" / "video", account / "video", account / "FileStorage" / "Video"]
+    index = {}
+    count = 0
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            for p in root.rglob("*.mp4"):
+                if not p.is_file():
+                    continue
+                count += 1
+                index.setdefault(p.stem.casefold(), []).append(p)
+        except OSError:
+            continue
+    return {"by_stem": index, "count": count}
+
+
+def _write_video_from_row(row, video_index, video_dir: Path):
+    vid = _extract_video_id(row)
+    candidates = video_index.get("by_stem", {}).get(vid.casefold(), []) if vid else []
+    if not candidates:
+        return None, (f"本机没有找到视频缓存：{vid}" if vid else "没有从消息中解析到视频标识")
+    try:
+        src = max(candidates, key=lambda p: (p.stat().st_size, p.stat().st_mtime))
+    except OSError:
+        src = candidates[0]
+    video_dir.mkdir(parents=True, exist_ok=True)
+    seq = row.get("sort_seq") or row.get("local_id") or "video"
+    lid = row.get("local_id") or "0"
+    out = video_dir / f"{seq}_{lid}.mp4"
+    try:
+        shutil.copy2(src, out)
+    except OSError as exc:
+        return None, f"复制视频失败：{exc}"
+    return {
+        "kind": "video",
+        "path": str(out),
+        "format": "mp4",
+        "previewable": False,
+    }, None
+
+
+def _relativize_media(chat_dir: Path, media: dict):
+    for key in ("path", "silk_path"):
+        value = media.get(key)
+        if not value:
+            continue
+        try:
+            media[key] = _relative_media_path(chat_dir, Path(value))
+        except Exception:
+            pass
+    media["available"] = True
+    return media
 
 
 def _write_txt(parsed: list[dict], path: Path, is_group: bool, target_name: str):
@@ -1126,7 +1668,6 @@ def _write_txt(parsed: list[dict], path: Path, is_group: bool, target_name: str)
         f.write(f"会话名称：{target_name}\n")
         f.write(f"消息总数：{len(parsed)}\n")
         f.write("=" * 70 + "\n\n")
-
         last_date = None
         for m in parsed:
             date = m["time"][:10] if len(m["time"]) >= 10 else ""
@@ -1135,64 +1676,62 @@ def _write_txt(parsed: list[dict], path: Path, is_group: bool, target_name: str)
                     f.write("\n")
                 f.write(f"========== {date} ==========\n\n")
                 last_date = date
-
-            f.write(
-                f"{m['time']} | {m['sender']}："
-                f"{m['content'] or '[' + m['type'] + ']'}\n"
-            )
+            f.write(f"{m['time']} | {m['sender']}：{m['content'] or '[' + m['type'] + ']'}\n")
             media = m.get("media")
             if media and media.get("available") and media.get("path"):
                 f.write(f"    ↳ {_media_label(media)}：{media['path']}\n")
+            transcript = m.get("transcript") or (media or {}).get("transcript")
+            if transcript:
+                source = m.get("transcript_source") or (media or {}).get("transcript_source")
+                label = "转文字（本地识别）" if source == "local_asr" else "转文字"
+                f.write(f"    ↳ {label}：{transcript}\n")
 
 
 def _md_message_content(content: str) -> str:
-    # 保留原始内容，只把换行换成 Markdown 硬换行。
     return (content or "").replace("\n", "  \n")
 
 
-def _write_markdown(
-    parsed: list[dict],
-    path: Path,
-    is_group: bool,
-    target_name: str,
-):
+def _write_markdown(parsed: list[dict], path: Path, is_group: bool, target_name: str):
     with path.open("w", encoding="utf-8", newline="\n") as f:
         f.write(f"# {target_name}\n\n")
         f.write(f"- 导出器：WeChat Chat Export for LLM v{APP_VERSION}\n")
         f.write(f"- 会话类型：{'群聊' if is_group else '私聊'}\n")
         f.write(f"- 消息总数：{len(parsed)}\n\n")
-
         last_date = None
         for m in parsed:
             date = m["time"][:10] if len(m["time"]) >= 10 else ""
             time_only = m["time"][11:19] if len(m["time"]) >= 19 else m["time"]
-
             if date and date != last_date:
                 f.write(f"\n## {date}\n\n")
                 last_date = date
-
-            content = _md_message_content(
-                m["content"] or f"[{m['type']}]"
-            )
+            content = _md_message_content(m["content"] or f"[{m['type']}]")
             f.write(f"**{time_only} | {m['sender']}：** {content}\n\n")
-
             media = m.get("media")
-            if not media or not media.get("available") or not media.get("path"):
-                continue
-
-            href = _markdown_href(media["path"])
-            if media.get("kind") == "image":
-                if media.get("previewable"):
-                    alt = "图片"
-                    if str(media.get("variant") or "").startswith("thumbnail"):
-                        alt = "图片（缩略图）"
-                    f.write(f"![{alt}]({href})\n\n")
-                else:
-                    f.write(f"[打开图片文件]({href})\n\n")
-            elif media.get("kind") == "file":
-                label = media.get("name") or Path(media["path"]).name
-                label = label.replace("[", "\\[").replace("]", "\\]")
-                f.write(f"[打开文件：{label}]({href})\n\n")
+            if media and media.get("available") and media.get("path"):
+                href = _markdown_href(media["path"])
+                kind = media.get("kind")
+                if kind == "image":
+                    if media.get("previewable"):
+                        alt = "图片"
+                        if str(media.get("variant") or "").startswith("thumbnail"):
+                            alt = "图片（缩略图）"
+                        safe_alt = html.escape(alt, quote=True)
+                        f.write(f'<img src="{href}" alt="{safe_alt}" width="640">\n\n')
+                    else:
+                        f.write(f"[打开图片文件]({href})\n\n")
+                elif kind == "file":
+                    label = (media.get("name") or Path(media["path"]).name).replace("[", "\\[").replace("]", "\\]")
+                    f.write(f"[文件：{label}]({href})\n\n")
+                elif kind == "voice":
+                    label = "播放语音（WAV）" if media.get("decoded") else "打开语音文件（SILK）"
+                    f.write(f"[{label}]({href})\n\n")
+                elif kind == "video":
+                    f.write(f"[播放视频]({href})\n\n")
+            transcript = m.get("transcript") or (media or {}).get("transcript")
+            if transcript:
+                source = m.get("transcript_source") or (media or {}).get("transcript_source")
+                label = "语音转文字（本地识别）" if source == "local_asr" else "语音转文字"
+                f.write(f"> {label}：{_md_message_content(transcript)}\n\n")
 
 
 def export_chat(
@@ -1201,22 +1740,25 @@ def export_chat(
     progress=None,
     export_images=False,
     export_files=False,
+    export_voices=False,
+    export_videos=False,
+    transcribe_voices=False,
 ):
     def log(msg):
         if progress:
             progress(msg)
 
+    if transcribe_voices:
+        export_voices = True
+
     log("正在连接微信本地数据库…")
     db = WeChatDB()
-
     target = find_contact(db, keyword)
     username = target["username"]
     target_name = target.get("remark") or target.get("nick_name") or keyword
     is_group = username.endswith("@chatroom")
-
     log(f"已识别：{'群聊' if is_group else '私聊'} · {target_name}")
     log("正在读取消息…")
-
     rows = load_rows(db, username)
     if not rows:
         raise ValueError("没有读取到该会话的消息。")
@@ -1224,12 +1766,10 @@ def export_chat(
     out_root = Path(out_root)
     chat_dir = out_root / safe_folder_name(target_name)
     chat_dir.mkdir(parents=True, exist_ok=True)
-
     self_info = db.get_self_info()
     self_nick = self_info.get("nick_name", "我")
     sender_index = db._sender_id_index()
     nicks = db._nickname_index()
-
     parsed = []
     type_counts = {}
 
@@ -1237,16 +1777,9 @@ def export_chat(
         raw_type = row.get("local_type")
         t = low_type(raw_type)
         type_counts[str(t)] = type_counts.get(str(t), 0) + 1
-
-        sender, used_group_prefix = resolve_sender(
-            db, row, is_group, target_name, sender_index, nicks, self_nick
-        )
-        content = parse_content(
-            raw_type,
-            row.get("message_content"),
-            row.get("compress_content"),
-            group_prefix_strip=(is_group and used_group_prefix),
-        )
+        sender, used_group_prefix = resolve_sender(db, row, is_group, target_name, sender_index, nicks, self_nick)
+        content = parse_content(raw_type, row.get("message_content"), row.get("compress_content"), group_prefix_strip=(is_group and used_group_prefix))
+        transcript = _voice_transcript(row) if t == 34 else ""
         parsed.append({
             "local_id": row.get("local_id"),
             "type": TYPE_LABEL.get(t, str(t)),
@@ -1255,46 +1788,39 @@ def export_chat(
             "time": fmt_time(row.get("create_time")),
             "content": content,
             "sort_seq": row.get("sort_seq"),
+            "transcript": transcript or None,
+            "transcript_source": "wechat" if transcript else None,
             "media": None,
         })
-
         if progress and idx % 2000 == 0:
             log(f"已处理 {idx}/{len(rows)} 条消息…")
 
     media_stats = {
-        "images_requested": 0,
-        "images_exported": 0,
-        "files_requested": 0,
-        "files_exported": 0,
+        "images_requested": 0, "images_exported": 0,
+        "files_requested": 0, "files_exported": 0,
+        "voices_requested": 0, "voices_exported": 0, "voices_decoded": 0,
+        "voice_transcripts": 0,
+        "voice_transcripts_native": 0,
+        "voice_transcripts_local": 0,
+        "voice_transcripts_cached": 0,
+        "voice_transcripts_failed": 0,
+        "videos_requested": 0, "videos_exported": 0,
     }
 
-    # 附件导出使用上游 MediaDownloader 的图片解密/文件名解析能力，
-    # 但消息行沿用本项目自己的跨分片读取结果。
-    if export_images or export_files:
+    if export_images or export_files or export_voices or export_videos:
         md = MediaDownloader(db)
         image_rows_exist = export_images and any(low_type(r.get("local_type")) == 3 for r in rows)
         file_rows_exist = export_files and any(
-            low_type(r.get("local_type")) == 49
-            and parse_content(
-                r.get("local_type"),
-                r.get("message_content"),
-                r.get("compress_content"),
-            ).startswith("[文件]")
+            low_type(r.get("local_type")) == 49 and parse_content(r.get("local_type"), r.get("message_content"), r.get("compress_content")).startswith("[文件]")
             for r in rows
         )
-
-        image_index = {}
-        image_keys = None
-        file_index = {}
-        image_failures = Counter()
-        file_failures = Counter()
+        video_rows_exist = export_videos and any(low_type(r.get("local_type")) == 43 for r in rows)
+        image_index, image_keys, file_index, video_index = {}, None, {}, {}
+        image_failures, file_failures, voice_failures, video_failures = Counter(), Counter(), Counter(), Counter()
 
         if image_rows_exist:
             log("正在定位本机图片缓存…")
             image_index = _index_image_files(db, username)
-
-            # WeChatDB 命中已缓存 keys.json 时，cfg_dword 默认不会再次提取。
-            # 图片解密的稳定路径却依赖 cfg_dword，所以媒体导出时主动补取一次。
             log("正在准备图片解密配置…")
             cfg_dword, cfg_error = _ensure_cfg_dword(db)
             if cfg_dword:
@@ -1305,92 +1831,161 @@ def export_chat(
                 log("已获取图片解密配置。")
             elif cfg_error:
                 log(f"图片解密配置暂未获取：{cfg_error}")
-
             if image_index:
                 image_keys = _detect_image_keys_fast(md)
-                if image_keys:
-                    log("图片解密密钥已就绪。")
-                else:
-                    log("未获取到图片解密密钥；将优先回退导出微信明文缩略图。")
-            else:
-                log("该会话 attach 目录没有找到加密图片；仍会尝试明文缩略图缓存。")
+                log("图片解密密钥已就绪。" if image_keys else "未获取到图片解密密钥；将优先回退导出微信明文缩略图。")
 
         if file_rows_exist:
             log("正在索引本机文件缓存…")
             file_index = _index_local_files(db)
-            log(
-                f"已索引本机文件缓存：{file_index.get('count', 0)} 个文件。"
-            )
+            log(f"已索引本机文件缓存：{file_index.get('count', 0)} 个文件。")
+
+        if video_rows_exist:
+            log("正在索引本机视频缓存…")
+            video_index = _index_video_files(db)
+            log(f"已索引本机视频缓存：{video_index.get('count', 0)} 个 MP4。")
+
+        if export_voices and _find_rust_silk() is None:
+            log("未找到 rust-silk：语音仍会导出为 SILK，但暂不能自动生成 WAV。")
+
+        asr_recognizer = None
+        asr_cache_path = None
+        asr_cache = {}
+        asr_cache_dirty = False
+        asr_failures = Counter()
+        if transcribe_voices:
+            ok, reason = local_asr_status()
+            if not ok:
+                raise RuntimeError(
+                    reason
+                    + "。请先安装本地语音识别模型后重新导出。"
+                )
+            log("正在加载 SenseVoice 本地语音识别模型（CPU，4 线程）…")
+            asr_recognizer = _create_local_asr_recognizer()
+            asr_cache_path, asr_cache = _load_asr_cache(Path(out_root))
+            log("本地语音识别已就绪。")
 
         image_dir = chat_dir / "media" / "images"
         file_dir = chat_dir / "media" / "files"
+        voice_dir = chat_dir / "media" / "voices"
+        video_dir = chat_dir / "media" / "videos"
 
         for idx, (row, msg) in enumerate(zip(rows, parsed), 1):
             t = low_type(row.get("local_type"))
-
             if export_images and t == 3:
                 media_stats["images_requested"] += 1
-                media, reason = _write_image_from_row(
-                    db,
-                    md,
-                    row,
-                    username,
-                    image_index,
-                    image_dir,
-                    image_keys,
-                )
+                media, reason = _write_image_from_row(db, md, row, username, image_index, image_dir, image_keys)
                 if media:
-                    rel = _relative_media_path(chat_dir, Path(media["path"]))
-                    media["path"] = rel
-                    media["available"] = True
-                    msg["media"] = media
+                    msg["media"] = _relativize_media(chat_dir, media)
                     media_stats["images_exported"] += 1
                 else:
-                    reason = reason or "未知原因"
-                    image_failures[reason] += 1
-                    msg["media"] = {
-                        "kind": "image",
-                        "available": False,
-                        "path": None,
-                        "reason": reason,
-                    }
+                    reason = reason or "未知原因"; image_failures[reason] += 1
+                    msg["media"] = {"kind": "image", "available": False, "path": None, "reason": reason}
 
             elif export_files and t == 49 and msg["content"].startswith("[文件]"):
                 media_stats["files_requested"] += 1
-                media, reason = _copy_file_from_row(
-                    md, row, msg["content"], file_index, file_dir
-                )
+                media, reason = _copy_file_from_row(md, row, msg["content"], file_index, file_dir)
                 if media:
-                    rel = _relative_media_path(chat_dir, Path(media["path"]))
-                    media["path"] = rel
-                    media["available"] = True
-                    msg["media"] = media
+                    msg["media"] = _relativize_media(chat_dir, media)
                     media_stats["files_exported"] += 1
                 else:
+                    reason = reason or "未知原因"; file_failures[reason] += 1
+                    msg["media"] = {"kind": "file", "available": False, "path": None, "reason": reason}
+
+            elif export_voices and t == 34:
+                media_stats["voices_requested"] += 1
+                media, reason, transcript = _write_voice_from_row(db, row, username, voice_dir)
+
+                if transcript:
+                    msg["transcript"] = transcript
+                    msg["transcript_source"] = "wechat"
+                    media_stats["voice_transcripts"] += 1
+                    media_stats["voice_transcripts_native"] += 1
+
+                if media:
+                    media_stats["voices_exported"] += 1
+                    if media.get("decoded"):
+                        media_stats["voices_decoded"] += 1
+                    elif reason:
+                        voice_failures[reason] += 1
+
+                    # 用户明确勾选后才运行本地 ASR。
+                    if transcribe_voices and not msg.get("transcript"):
+                        if media.get("decoded") and str(media.get("path") or "").lower().endswith(".wav"):
+                            cache_key = media.get("voice_sha256") or ""
+                            cached = asr_cache.get(cache_key) if cache_key else None
+                            if cached:
+                                msg["transcript"] = cached
+                                msg["transcript_source"] = "local_asr"
+                                media["transcript"] = cached
+                                media["transcript_source"] = "local_asr"
+                                media_stats["voice_transcripts"] += 1
+                                media_stats["voice_transcripts_local"] += 1
+                                media_stats["voice_transcripts_cached"] += 1
+                            else:
+                                asr_text, asr_reason = _transcribe_wav_local(
+                                    asr_recognizer,
+                                    Path(media["path"]),
+                                )
+                                if asr_text:
+                                    msg["transcript"] = asr_text
+                                    msg["transcript_source"] = "local_asr"
+                                    media["transcript"] = asr_text
+                                    media["transcript_source"] = "local_asr"
+                                    media_stats["voice_transcripts"] += 1
+                                    media_stats["voice_transcripts_local"] += 1
+                                    if cache_key:
+                                        asr_cache[cache_key] = asr_text
+                                        asr_cache_dirty = True
+                                else:
+                                    media_stats["voice_transcripts_failed"] += 1
+                                    asr_failures[asr_reason or "未知识别错误"] += 1
+                        else:
+                            media_stats["voice_transcripts_failed"] += 1
+                            asr_failures["语音未成功转换为 WAV，无法进行本地识别"] += 1
+
+                    msg["media"] = _relativize_media(chat_dir, media)
+                else:
                     reason = reason or "未知原因"
-                    file_failures[reason] += 1
+                    voice_failures[reason] += 1
+                    if transcribe_voices and not msg.get("transcript"):
+                        media_stats["voice_transcripts_failed"] += 1
+                        asr_failures["语音文件未成功导出"] += 1
                     msg["media"] = {
-                        "kind": "file",
+                        "kind": "voice",
                         "available": False,
                         "path": None,
                         "reason": reason,
+                        "transcript": transcript,
                     }
 
-            if progress and idx % 200 == 0 and (export_images or export_files):
+            elif export_videos and t == 43:
+                media_stats["videos_requested"] += 1
+                media, reason = _write_video_from_row(row, video_index, video_dir)
+                if media:
+                    msg["media"] = _relativize_media(chat_dir, media)
+                    media_stats["videos_exported"] += 1
+                else:
+                    reason = reason or "未知原因"; video_failures[reason] += 1
+                    msg["media"] = {"kind": "video", "available": False, "path": None, "reason": reason}
+
+            if progress and idx % 200 == 0:
                 log(
-                    "附件处理进度："
-                    f"{idx}/{len(rows)}，"
+                    f"附件处理进度：{idx}/{len(rows)}，"
                     f"图片 {media_stats['images_exported']}/{media_stats['images_requested']}，"
-                    f"文件 {media_stats['files_exported']}/{media_stats['files_requested']}"
+                    f"文件 {media_stats['files_exported']}/{media_stats['files_requested']}，"
+                    f"语音 {media_stats['voices_exported']}/{media_stats['voices_requested']}，"
+                    f"视频 {media_stats['videos_exported']}/{media_stats['videos_requested']}"
                 )
+
+    if transcribe_voices and 'asr_cache_dirty' in locals() and asr_cache_dirty and asr_cache_path:
+        _save_asr_cache(asr_cache_path, asr_cache)
 
     txt_path = chat_dir / "chat_full_for_llm.txt"
     md_path = chat_dir / "chat_full_for_llm.md"
     json_path = chat_dir / "chat_full_parsed.json"
-
     _write_txt(parsed, txt_path, is_group, target_name)
     _write_markdown(parsed, md_path, is_group, target_name)
-
     with json_path.open("w", encoding="utf-8-sig") as f:
         json.dump({
             "exporter_version": APP_VERSION,
@@ -1403,32 +1998,36 @@ def export_chat(
         }, f, ensure_ascii=False, indent=2)
 
     log(f"完成：{len(parsed)} 条消息")
-    if export_images:
+    summaries = [
+        (export_images, "图片", "images", image_failures if 'image_failures' in locals() else Counter()),
+        (export_files, "文件", "files", file_failures if 'file_failures' in locals() else Counter()),
+        (export_voices, "语音", "voices", voice_failures if 'voice_failures' in locals() else Counter()),
+        (export_videos, "视频", "videos", video_failures if 'video_failures' in locals() else Counter()),
+    ]
+    for enabled, label, key, failures in summaries:
+        if not enabled:
+            continue
+        requested = media_stats[f"{key}_requested"]
+        exported = media_stats[f"{key}_exported"]
+        log(f"{label}：{exported}/{requested} 已导出")
+        if failures:
+            summary = "；".join(f"{count}× {reason}" for reason, count in failures.most_common(3))
+            log(f"{label}提示：{summary}")
+    if export_voices:
+        log(f"语音 WAV：{media_stats['voices_decoded']}/{media_stats['voices_exported']}")
+    if transcribe_voices:
         log(
-            f"图片：{media_stats['images_exported']}/"
-            f"{media_stats['images_requested']} 已导出"
+            f"语音转文字：{media_stats['voice_transcripts']}/{media_stats['voices_requested']}；"
+            f"本地识别 {media_stats['voice_transcripts_local']}；"
+            f"复用缓存 {media_stats['voice_transcripts_cached']}；"
+            f"失败 {media_stats['voice_transcripts_failed']}"
         )
-        if media_stats["images_exported"] < media_stats["images_requested"]:
-            failures = locals().get("image_failures", Counter())
-            if failures:
-                summary = "；".join(
-                    f"{count}× {reason}"
-                    for reason, count in failures.most_common(3)
-                )
-                log(f"图片未导出主要原因：{summary}")
-    if export_files:
-        log(
-            f"文件：{media_stats['files_exported']}/"
-            f"{media_stats['files_requested']} 已导出"
-        )
-        if media_stats["files_exported"] < media_stats["files_requested"]:
-            failures = locals().get("file_failures", Counter())
-            if failures:
-                summary = "；".join(
-                    f"{count}× {reason}"
-                    for reason, count in failures.most_common(3)
-                )
-                log(f"文件未导出主要原因：{summary}")
+        if 'asr_failures' in locals() and asr_failures:
+            summary = "；".join(
+                f"{count}× {reason}"
+                for reason, count in asr_failures.most_common(3)
+            )
+            log(f"语音转文字提示：{summary}")
 
     return {
         "chat_name": target_name,

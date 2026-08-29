@@ -1,274 +1,114 @@
 # 微信聊天导出给大模型
 
-**WeChat Chat Export for LLM**
+把 Windows 微信 4.x 里的聊天记录整理成 TXT、Markdown 和 JSON。可以直接拿去给大模型读，也可以留着做检索、整理或二次处理。
 
-把 Windows 微信 4.x 的私聊、群聊整理成 TXT / JSON，方便直接交给 GPT、Claude、Gemini 等大模型读取。
+目前源码版本是 **v1.3.0**。
 
-这个项目不做完整微信备份，重点是把聊天内容尽量还原成「人能看、大模型也容易读」的文本。
-
-## 下载
-
-当前版本：**v1.1.2**
-
-- [下载 Windows EXE](https://github.com/zhuzhangxue/wechat-chat-export-for-llm/releases/download/v1.1.2/WeChat-Chat-Export-for-LLM.exe)
-- [下载 Windows ZIP](https://github.com/zhuzhangxue/wechat-chat-export-for-llm/releases/download/v1.1.2/WeChat-Chat-Export-for-LLM-Windows.zip)
-- [查看 Releases](https://github.com/zhuzhangxue/wechat-chat-export-for-llm/releases)
-
-EXE 是单文件版本，不需要另外安装 Python、Conda 或项目依赖。
-
-> 使用前请先启动并登录 Windows 微信，并保持微信在后台运行。
+这个工具不是微信备份软件。它做的事情比较单一：从本机微信读取你能访问的聊天，把文字、引用、群成员、图片、文件、语音、视频等尽量整理成一套好读的导出结果。
 
 ## 怎么用
 
-1. 启动并登录 Windows 微信。
-2. 打开 `WeChat-Chat-Export-for-LLM.exe`。
-3. 输入好友的准确备注名、昵称，或者群聊名称。
-4. 选择输出目录；不改的话默认写到程序旁边的 `exports`。
-5. 点击「开始导出」。
-6. 完成后点击右下角「打开导出文件夹」。
+Windows 版不需要另外安装 Python。先登录 Windows 微信并保持微信在后台运行，然后打开程序，输入好友的准确备注、昵称或群名，选择要不要附带导出图片、文件、语音、视频，最后点「开始导出」。
 
-程序会在开始导出前检查微信是否正在运行，没有检测到时会直接提示。
+媒体文件只会导出本机还留有缓存的内容。微信本地已经清掉的图片、文件或视频，程序也没办法凭空恢复。
 
-不同会话会分别保存：
+导出完成后会得到类似这样的目录：
 
 ```text
 exports/
-├─ 好友 A/
-│  ├─ chat_full_for_llm.txt
-│  └─ chat_full_parsed.json
-└─ 某个群聊/
+└─ 某个聊天/
    ├─ chat_full_for_llm.txt
-   └─ chat_full_parsed.json
+   ├─ chat_full_for_llm.md
+   ├─ chat_full_parsed.json
+   └─ media/
+      ├─ images/
+      ├─ files/
+      ├─ voices/
+      └─ videos/
 ```
 
-其中：
+`TXT` 最适合直接上传给大模型；`Markdown` 方便自己阅读，图片会直接显示；`JSON` 保留的结构最多，适合脚本或后续开发。
 
-- `chat_full_for_llm.txt`：适合直接上传给大模型。
-- `chat_full_parsed.json`：保留更多结构化字段，适合脚本处理或二次开发。
+程序里还有一个简单的「聊天预览」。图片直接显示，文件、语音和视频通过 Windows 默认程序打开，不需要在 VS Code 里点附件。
 
-## 导出效果
+## 语音和语音转文字
 
-TXT 会按日期、时间和发送者整理：
+「语音」和「语音转文字（本地）」是两个选项。
 
-```text
-========== 2026-08-29 ==========
+只勾「语音」时，程序会把能找到的微信语音导出成 WAV。Windows 构建里自带 `rust-silk`，正常转换成功后不会额外留一份 SILK 中间文件。
 
-2026-08-29 10:21:03 | 张三：下午几点集合？
-2026-08-29 10:21:18 | 李四：三点吧
-2026-08-29 10:21:26 | 我：可以
-2026-08-29 10:22:01 | 王五：[图片]
+勾「语音转文字（本地）」时，会自动同时开启语音导出，然后用 SenseVoice 在本机识别。这个功能默认关闭。
 
-2026-08-29 10:23:14 | 李四：我觉得改成三点半更好
-    ↳ 引用 张三：下午几点集合？
+第一次使用本地转写时，程序会询问是否下载约 230 MB 的 SenseVoice Small Int8 模型。模型下载一次后会保存在用户目录，以后的识别不需要重新下载，语音本身也不会上传到远端。
 
-2026-08-29 10:30:42 | 张三：[撤回] “张三”撤回了一条消息
+识别过的语音会按内容哈希缓存结果。重复导出同一条语音时，能命中缓存就直接复用，不再跑一遍模型。
+
+## 目前处理的内容
+
+普通文字、长文本、引用回复、撤回和系统消息都尽量恢复成可读内容。群聊会尽量还原真实发送者，而不是只留一个 `wxid`。
+
+图片、文件、语音和视频可以导出本体；链接、卡片、位置、动画表情等消息会尽量保留标题或可读描述。微信内部消息类型很多，少数特殊卡片仍可能只能显示占位符。
+
+图片和视频的本地缓存格式也不完全统一，所以导出是否成功取决于本机还保存着什么。程序不会为了补媒体内容去登录云端或上传聊天。
+
+## 下载和构建
+
+稳定发布包放在 [Releases](https://github.com/zhuzhangxue/wechat-chat-export-for-llm/releases)。如果 Releases 里的版本暂时落后于源码，也可以到 [Actions](https://github.com/zhuzhangxue/wechat-chat-export-for-llm/actions) 下载最新一次 `Build Windows EXE` 的 artifact。
+
+当前 EXE 没有商业代码签名证书，第一次运行可能遇到 Windows SmartScreen 提示。仓库源码和 GitHub Actions 构建脚本都是公开的；不想运行未签名程序的话，可以直接从源码运行或自己构建。没必要为了这个工具关闭 Defender、SmartScreen，也不建议给目录加安全软件排除项。
+
+## 从源码运行
+
+推荐 Windows 10/11、Python 3.12、Windows 微信 4.x。
+
+```powershell
+python -m pip install -r requirements.txt
+python app.py
 ```
 
-## 目前能处理哪些消息
+命令行也可以用：
 
-| 消息类型 | 导出结果 |
-| --- | --- |
-| 普通文字 | 保留正文 |
-| 较长文字 / 压缩文本 | 尝试解压后恢复正文 |
-| 引用回复 | 保留回复正文和被引用内容 |
-| 图片 | `[图片]` |
-| 语音 | `[语音]` |
-| 视频 | `[视频]` |
-| 动画表情 | `[动画表情]` |
-| 位置 | `[位置]` |
-| 文件 | 尽量保留文件名 |
-| 链接 / 卡片 | 尽量保留标题或描述 |
-| 撤回消息 | 简化成可读的 `[撤回] ...` |
-| 其他系统消息 | 尽量去掉原始 XML，只留下可读内容 |
-
-微信内部的消息类型很多，少数特殊卡片仍可能只能显示成占位符。
-
-图片、语音、视频等目前只保留「这里曾经有一条什么类型的消息」，不会把媒体文件本体导出来。
-
-## 群聊
-
-群聊和私聊最大的区别之一，是发送者信息不总在同一个字段里。
-
-微信 4.x 的部分群消息会把真实发送者写在正文前面，例如：
-
-```text
-wxid_xxxxx: 正文
+```powershell
+python cli.py "好友备注名或群名" --images --files --voices --videos
 ```
 
-程序会优先从这里识别成员，再结合联系人昵称和底层 sender 信息补充。
+如果想在命令行使用本地语音转文字：
 
-如果都无法还原，才会显示类似：
-
-```text
-成员#123
+```powershell
+python cli.py --install-asr
+python cli.py "好友备注名或群名" --transcribe-voices
 ```
 
-所以群聊可以导出，但极少数消息的成员昵称仍可能识别不完整。
+## Windows 构建
 
-## 为什么要单独做这个项目
+`.github/workflows/build-windows.yml` 会在 GitHub Actions 的 Windows 环境里打包单文件 EXE。
 
-底层数据库读取和解密由 [`fanyuantaier/wechatauto-replica`](https://github.com/fanyuantaier/wechatauto-replica) 完成。
+构建时会固定下载 `rust-silk v0.1.3` 的 Windows x64 文件并校验 SHA-256，再和 Python 运行时、`sherpa-onnx`、微信数据库读取依赖等一起打进 EXE。SenseVoice 模型本身不打进 EXE，只有用户主动开启本地转写并确认后才下载。
 
-这个项目没有重新实现微信数据库解密，主要处理的是「读出来以后怎么整理给大模型」的问题。
-
-实际聊天数据库里，一些看起来是普通文字的内容并不直接以普通文字保存。例如：
-
-- 长文本可能经过 Zstandard 压缩；
-- 引用回复位于 `appmsg` 结构中，常见 `type=57`；
-- 撤回消息可能直接是一段 XML；
-- 群聊发送者有时要从消息正文前缀里还原。
-
-如果只按最外层消息类型导出，最后很容易得到一堆：
-
-```text
-[文本]
-[文件/链接/卡片]
-```
-
-真正有用的聊天内容反而丢了。
-
-本项目主要补的就是这一层解析和整理。
-
-当前构建固定使用上游提交：
+底层微信数据库读取使用 [`fanyuantaier/wechatauto-replica`](https://github.com/fanyuantaier/wechatauto-replica)，目前固定在提交：
 
 ```text
 04ef8cbde3862cff90b5f6b42c9ebfcea44ef48d
 ```
 
-上游使用 Apache License 2.0，相关说明见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
+其他第三方组件和许可证见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
 
-## Windows SmartScreen
+## 隐私和已知限制
 
-当前发布的 EXE 还没有可信代码签名证书。
+聊天记录只写到你选择的本地目录。项目没有把聊天内容上传到服务器的功能；本地语音识别下载的是模型文件，识别过程本身在电脑上完成。
 
-因此第一次下载运行时，Windows SmartScreen 可能显示「Windows 已保护你的电脑」或「无法识别的应用」。
+使用前仍建议保留微信原数据，不要把导出目录、数据库、密钥或真实私人聊天内容提交到 GitHub。仓库的 `.gitignore` 能挡住一部分常见文件，但不能代替自己检查 `git status`。
 
-这是因为 Windows 暂时无法验证这个新程序的发布者和应用信誉，不等同于已经检测到病毒。
+目前主要限制是：只支持 Windows 和 Windows 微信 4.x；同名联系人或群聊可能匹配歧义；部分特殊消息和群成员昵称无法百分之百还原；媒体只能导出本机仍有缓存的部分；微信更新数据库结构后也可能需要跟着适配。
 
-项目源码和 GitHub Actions 构建流程都公开在仓库里。如果你不愿意运行未签名的 EXE，可以直接查看源码并自行构建。
-
-**不建议为了运行本工具关闭 Microsoft Defender、关闭 SmartScreen，或给整个目录添加安全软件排除项。**
-
-## 为什么 EXE 有 70 多 MB
-
-Windows 版使用 PyInstaller 打成单文件 EXE。
-
-为了让普通用户不需要另外安装 Python 和依赖，Python 运行时、微信数据读取相关依赖等都会一起打进程序，所以文件体积会明显大于源码本身。
-
-`--onefile` 模式启动时还需要先解包运行环境，因此第一次打开可能会比普通原生小工具慢几秒，这是正常现象。
-
-## 从源码运行
-
-推荐环境：
-
-```text
-Windows 10 / 11
-Python 3.12
-Windows 微信 4.x
-```
-
-安装依赖：
-
-```powershell
-python -m pip install zstandard
-python -m pip install "https://github.com/fanyuantaier/wechatauto-replica/archive/04ef8cbde3862cff90b5f6b42c9ebfcea44ef48d.zip"
-```
-
-启动图形界面：
-
-```powershell
-python app.py
-```
-
-也可以使用命令行：
-
-```powershell
-python cli.py "好友备注名或群名"
-```
-
-## Windows EXE 怎么构建
-
-仓库里的：
-
-```text
-.github/workflows/build-windows.yml
-```
-
-会通过 GitHub Actions 在 Windows 环境中自动打包 EXE。
-
-修改这些文件并提交到 `main` 后会触发新构建：
-
-```text
-app.py
-cli.py
-exporter_core.py
-requirements.txt
-assets/app.ico
-.github/workflows/build-windows.yml
-```
-
-也可以在 GitHub 的 Actions 页面手动运行 `Build Windows EXE`。
-
-当前 GUI 和 EXE 使用同一套应用图标。
-
-## 隐私
-
-聊天记录本身就是敏感数据。
-
-导出文件只写到你选择的本地目录，本项目没有提供把聊天内容上传到远端的功能。
-
-仓库的 `.gitignore` 已排除常见的敏感文件和构建产物：
-
-```text
-exports/
-final_export/
-**/keys.json
-wechatauto_db/
-*.sqlite
-*.sqlite3
-build/
-dist/
-*.spec
-```
-
-不过 `.gitignore` 不是保险箱。提交代码前仍建议看一眼：
-
-```bash
-git status
-```
-
-确认没有把自己的聊天 TXT / JSON、wxid、数据库、`keys.json` 或其他个人数据带进提交。
-
-## 已知限制
-
-目前比较明确的限制有：
-
-- 只支持 Windows；
-- 当前主要面向 Windows 微信 4.x；
-- 不导出图片、语音、视频等媒体文件本体；
-- 同名联系人或同名群聊可能产生匹配歧义；
-- 少数特殊消息类型仍可能解析不完整；
-- 群成员昵称只能尽量还原；
-- 微信版本更新后，数据库结构或密钥机制变化可能导致现有版本失效。
-
-如果遇到某类消息长期显示成占位符，可以附上**脱敏后的消息类型和结构**提 Issue。
-
-请不要直接上传真实聊天数据库、密钥或私人聊天内容。
+遇到解析问题可以提交 Issue，但请先脱敏，不要直接上传真实聊天数据库、密钥或完整私人聊天记录。
 
 ## 免责声明
 
-本项目是独立的开源工具，与腾讯、微信（WeChat / Weixin）及其关联公司没有隶属、授权、认可或合作关系。
+本项目是独立开源工具，与腾讯、微信（WeChat / Weixin）及其关联公司没有隶属、授权、认可或合作关系。微信、WeChat、Weixin 及相关名称、商标归其各自权利人所有。
 
-微信、WeChat、Weixin 及相关名称、商标归其各自权利人所有。
-
-本项目仅用于处理使用者本人有权访问的本地数据。使用者应自行确认其对相关数据拥有合法的访问和处理权限，并遵守所在地法律法规、相关软件服务条款以及聊天参与者的隐私权。
-
-请勿使用本项目访问、导出、分析或传播自己无权处理的数据。
-
-软件按「现状」提供。微信客户端升级、系统环境变化或上游依赖调整，都可能导致功能失效、兼容性变化或导出结果不完整。使用前请自行备份重要数据。
+请只处理你本人有权访问和处理的数据，并自行遵守所在地法律法规、软件服务条款以及聊天参与者的隐私权。软件按「现状」提供；微信版本、系统环境或上游依赖变化都可能导致功能失效或导出结果不完整。
 
 ## License
 
-Apache License 2.0。
-
-第三方依赖和许可信息见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
+Apache License 2.0。第三方依赖按各自许可证使用，见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
