@@ -31,6 +31,7 @@ class ChatPreview(tk.Toplevel):
         # Thumbnail cache avoids decoding the same image again when loading older pages.
         self.image_cache = {}
         self.embedded_widgets = []
+        self.separator_widgets = []
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -88,6 +89,7 @@ class ChatPreview(tk.Toplevel):
         self.text.configure(yscrollcommand=self.scrollbar.set)
         self.text.grid(row=0, column=0, sticky="nsew")
         self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.text.bind("<Configure>", self._resize_separators, add="+")
 
         self._configure_tags()
 
@@ -124,12 +126,6 @@ class ChatPreview(tk.Toplevel):
             lmargin2=16,
             spacing3=4,
         )
-        self.text.tag_configure(
-            "separator",
-            foreground="#A8A8A8",
-            spacing1=4,
-            spacing3=4,
-        )
 
     def _close(self):
         self.image_cache.clear()
@@ -145,6 +141,7 @@ class ChatPreview(tk.Toplevel):
         self._set_editable(True)
         self.text.delete("1.0", "end")
         self.embedded_widgets.clear()
+        self.separator_widgets.clear()
 
         shown = len(self.messages) - self.start_index
         self.count_label.configure(text=f"显示 {shown}/{len(self.messages)} 条")
@@ -228,8 +225,36 @@ class ChatPreview(tk.Toplevel):
                 "transcript",
             )
 
-        # A lightweight text separator avoids creating one widget per message.
-        self.text.insert("end", "─" * 92 + "\n", "separator")
+        self._insert_separator()
+
+    def _insert_separator(self):
+        # One lightweight 1 px line per message. This keeps the original
+        # "solid line + breathing room" look without rebuilding each message
+        # as a nested Frame/Label tree.
+        self.text.insert("end", "\n")
+        line = tk.Frame(
+            self.text,
+            height=1,
+            borderwidth=0,
+            highlightthickness=0,
+            background="#B8B8B8",
+        )
+        self.separator_widgets.append(line)
+        self.embedded_widgets.append(line)
+        self.text.window_create("end", window=line, padx=0, pady=0)
+        self.text.insert("end", "\n\n")
+        self.after_idle(self._resize_separators)
+
+    def _resize_separators(self, _event=None):
+        if not self.separator_widgets:
+            return
+        width = max(120, self.text.winfo_width() - 48)
+        for line in self.separator_widgets:
+            try:
+                if line.winfo_exists():
+                    line.configure(width=width)
+            except tk.TclError:
+                pass
 
     def _insert_button(self, text, command):
         button = ttk.Button(self.text, text=text, command=command)
