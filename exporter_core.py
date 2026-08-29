@@ -8,6 +8,8 @@ import json
 import os
 import re
 import shutil
+import unicodedata
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -401,7 +403,13 @@ def resolve_sender(
     return resolved, False
 
 
+
 def _extract_media_md5(row: dict) -> str:
+    """旧式兜底：从消息自身字段里找 32 位十六进制串。
+
+    注意：微信 4.x 图片文件名使用的 fileHash 不一定等于消息 XML 里的 md5，
+    所以图片定位会优先查询 message_resource.db，这里只做 fallback。
+    """
     for value in (row.get("packed_info_data"), row.get("message_content")):
         if isinstance(value, (bytes, bytearray)):
             m = re.search(rb"([0-9a-fA-F]{32})", bytes(value))
@@ -412,6 +420,75 @@ def _extract_media_md5(row: dict) -> str:
             if m:
                 return m.group(1).lower()
     return ""
+
+
+def _find_db_rel(db: WeChatDB, basename: str):
+    target = basename.casefold()
+    for item in getattr(db, "_db_files", []):
+        if len(item) < 2:
+            continue
+        rel, path = item[0], item[1]
+        if Path(path).name.casefold() == target:
+            return rel
+    return None
+
+
+def _extract_resource_hash(blob) -> str:
+    """从 MessageResourceInfo.packed_info 的 protobuf blob 中提取图片 fileHash。"""
+    if blob is None:
+        return ""
+    if isinstance(blob, str):
+        data = blob.encode("utf-8", "ignore")
+    elif isinstance(blob, (bytes, bytearray, memoryview)):
+        data = bytes(blob)
+    else:
+        return ""
+
+    # 常见 protobuf: 12 22 0a 20 + 32 ASCII hex
+    marker = b"\x12\x22\x0a\x20"
+    pos = data.find(marker)
+    if pos >= 0 and pos + 4 + 32 <= len(data):
+        cand = data[pos + 4: pos + 4 + 32]
+        if re.fullmatch(rb"[0-9a-fA-F]{32}", cand):
+            return cand.decode("ascii").lower()
+
+    # 兜底：任意独立的 32 位 hex 串。
+    m = re.search(rb"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])", data)
+    if m:
+        return m.group(1).decode("ascii").lower()
+    return ""
+
+
+def _resource_image_hash(db: WeChatDB, username: str, local_id) -> str:
+    """通过 message_resource.db 的 chat_id + message_local_id 取得真实 .dat fileHash。"""
+    if local_id in (None, ""):
+        return ""
+    rel = _find_db_rel(db, "message_resource.db")
+    if not rel:
+        return ""
+
+    conn = db._open(rel)
+    try:
+        row = conn.execute(
+            "SELECT rowid FROM ChatName2Id WHERE user_name=? LIMIT 1",
+            (username,),
+        ).fetchone()
+        if not row:
+            return ""
+        chat_id = row[0]
+
+        info = conn.execute(
+            "SELECT packed_info FROM MessageResourceInfo "
+            "WHERE chat_id=? AND message_local_id=? LIMIT 1",
+            (chat_id, local_id),
+        ).fetchone()
+        if not info:
+            return ""
+        return _extract_resource_hash(info[0])
+    except Exception:
+        return ""
+    finally:
+        conn.close()
 
 
 def _index_image_files(db: WeChatDB, username: str) -> dict[str, Path]:
@@ -429,18 +506,115 @@ def _index_image_files(db: WeChatDB, username: str) -> dict[str, Path]:
     return out
 
 
-def _index_local_files(db: WeChatDB) -> dict[str, list[Path]]:
-    base = Path(db.account_dir) / "msg" / "file"
-    out: dict[str, list[Path]] = {}
-    if not base.exists():
-        return out
+def _normalize_timestamp(ts) -> int:
     try:
-        for p in base.rglob("*"):
-            if p.is_file():
-                out.setdefault(p.name.casefold(), []).append(p)
+        value = int(ts)
+        if value > 10_000_000_000:
+            value //= 1000
+        return value
+    except Exception:
+        return 0
+
+
+def _find_plain_thumbnail(
+    db: WeChatDB,
+    username: str,
+    local_id,
+    create_time,
+) -> Path | None:
+    """查找微信已生成的明文聊天缩略图，不需要图片 AES 密钥。"""
+    ts = _normalize_timestamp(create_time)
+    if not ts or local_id in (None, ""):
+        return None
+
+    chat_md5 = hashlib.md5(username.encode("utf-8")).hexdigest()
+    month = datetime.fromtimestamp(ts).strftime("%Y-%m")
+    thumb_dir = (
+        Path(db.account_dir)
+        / "cache"
+        / month
+        / "Message"
+        / chat_md5
+        / "Thumb"
+    )
+    if not thumb_dir.exists():
+        return None
+
+    exact = thumb_dir / f"{local_id}_{ts}_thumb.jpg"
+    if exact.exists():
+        return exact
+
+    # create_time 在部分表中精度/值会略有差异，按 local_id 兜底。
+    prefix = f"{local_id}_"
+    try:
+        hits = [
+            p for p in thumb_dir.iterdir()
+            if p.is_file() and p.name.startswith(prefix)
+        ]
     except OSError:
-        pass
-    return out
+        return None
+    if not hits:
+        return None
+    try:
+        return max(hits, key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return hits[0]
+
+
+def _filename_key(name: str) -> str:
+    return unicodedata.normalize("NFC", name or "").strip().casefold()
+
+
+def _filename_loose_key(name: str) -> str:
+    """忽略 Windows 重名下载产生的 (1)/(2) 后缀后匹配。"""
+    name = unicodedata.normalize("NFC", name or "").strip()
+    p = Path(name)
+    stem = re.sub(r"\s*[\(（]\d+[\)）]\s*$", "", p.stem)
+    return (stem + p.suffix).casefold()
+
+
+def _index_local_files(db: WeChatDB) -> dict:
+    """索引微信可能使用的文件缓存目录；同时建立严格/宽松文件名索引。"""
+    roots = [
+        Path(db.account_dir) / "msg" / "file",
+        Path(db.account_dir) / "FileStorage" / "File",
+        Path(db.account_dir) / "file",
+    ]
+    # 老版本/迁移目录可能还保留 MsgAttach。仅在目录存在时索引。
+    msg_attach = Path(db.account_dir) / "FileStorage" / "MsgAttach"
+    if msg_attach.exists():
+        roots.append(msg_attach)
+
+    exact: dict[str, list[Path]] = {}
+    loose: dict[str, list[Path]] = {}
+    seen = set()
+
+    for base in roots:
+        if not base.exists():
+            continue
+        try:
+            iterator = base.rglob("*")
+            for p in iterator:
+                if not p.is_file():
+                    continue
+                try:
+                    rp = str(p.resolve())
+                except OSError:
+                    rp = str(p)
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                exact.setdefault(_filename_key(p.name), []).append(p)
+                loose.setdefault(_filename_loose_key(p.name), []).append(p)
+        except OSError:
+            continue
+
+    return {
+        "exact": exact,
+        "loose": loose,
+        "count": len(seen),
+        "roots": [str(p) for p in roots if p.exists()],
+    }
 
 
 def _pick_file_candidate(candidates: list[Path], create_time) -> Path | None:
@@ -448,10 +622,9 @@ def _pick_file_candidate(candidates: list[Path], create_time) -> Path | None:
         return None
     month = ""
     try:
-        value = int(create_time)
-        if value > 10_000_000_000:
-            value //= 1000
-        month = datetime.fromtimestamp(value).strftime("%Y-%m")
+        value = _normalize_timestamp(create_time)
+        if value:
+            month = datetime.fromtimestamp(value).strftime("%Y-%m")
     except Exception:
         pass
 
@@ -473,6 +646,27 @@ def _relative_media_path(chat_dir: Path, path: Path) -> str:
 def _markdown_href(rel_path: str) -> str:
     return quote(rel_path.replace("\\", "/"), safe="/._-~")
 
+
+
+
+def _ensure_cfg_dword(db: WeChatDB):
+    """keys.json 命中时上游不会再提取 cfgDword；媒体导出时主动补取一次。"""
+    current = getattr(db, "cfg_dword", None)
+    if current:
+        return current, None
+    try:
+        auto = db.extract_master_key()
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    if not auto:
+        return None, "未能从当前微信进程提取 cfgDword"
+    master, cfg_dword, _wxid = auto
+    if master:
+        db.master_key = master
+    if cfg_dword:
+        db.cfg_dword = cfg_dword
+        return cfg_dword, None
+    return None, "提取结果中没有 cfgDword"
 
 
 def _detect_image_keys_fast(md: MediaDownloader):
@@ -504,7 +698,10 @@ def _detect_image_keys_fast(md: MediaDownloader):
     except Exception:
         return None
 
+
+
 def _write_image_from_row(
+    db: WeChatDB,
     md: MediaDownloader,
     row: dict,
     username: str,
@@ -512,119 +709,206 @@ def _write_image_from_row(
     image_dir: Path,
     image_keys,
 ):
-    media_md5 = _extract_media_md5(row)
-    if not media_md5:
-        return None, "消息中没有找到图片 MD5"
+    """优先导出原图；无法解密时回退微信明文缩略图。"""
+    local_id = row.get("local_id")
 
-    dat_path = image_index.get((media_md5 + ".dat").lower())
+    # 微信 4.x .dat 文件名通常不是 XML md5，优先从 message_resource.db 解析 fileHash。
+    file_hash = _resource_image_hash(db, username, local_id)
+    if not file_hash:
+        file_hash = _extract_media_md5(row)
+
+    dat_path = None
     variant = "original"
-    if dat_path is None:
-        dat_path = image_index.get((media_md5 + "_t.dat").lower())
-        variant = "thumbnail"
+    if file_hash:
+        # 顺序：普通图 → 高清图 → 加密缩略图
+        for suffix, var in (
+            (".dat", "original"),
+            ("_h.dat", "high"),
+            ("_t.dat", "thumbnail-dat"),
+        ):
+            candidate = image_index.get((file_hash + suffix).lower())
+            if candidate is not None:
+                dat_path = candidate
+                variant = var
+                break
 
-    if dat_path is None:
-        return None, "本机没有找到图片原图或缩略图缓存"
+    # 找到了 .dat 且有密钥/旧格式可解，就优先输出它。
+    dat_reason = None
+    if dat_path is not None:
+        aes_key = image_keys[0] if image_keys else None
+        xor_key = image_keys[1] if image_keys else None
 
-    aes_key = image_keys[0] if image_keys else None
-    xor_key = image_keys[1] if image_keys else None
-
-    try:
-        with dat_path.open("rb") as fh:
-            magic = fh.read(6)
-    except OSError as exc:
-        return None, f"图片缓存读取失败：{exc}"
-
-    # 微信 4.x v2 图片需要 AES 密钥。若快速获取失败，直接跳过，
-    # 避免上游进入每张图最长 120 秒的监控等待。
-    if magic == b"\x07\x08\x56\x32\x08\x07" and not image_keys:
-        return None, "未获取到图片解密密钥"
-
-    try:
-        data = md.decrypt_image(str(dat_path), aes_key=aes_key, xor_key=xor_key)
-    except Exception as exc:
-        return None, f"图片解密失败：{type(exc).__name__}: {exc}"
-
-    if data[:3] == b"\xff\xd8\xff":
-        ext = ".jpg"
-    elif data[:4] == b"\x89PNG":
-        ext = ".png"
-    elif data[:3] == b"GIF":
-        ext = ".gif"
-    elif data[:4] == b"wxgf":
         try:
-            jpg = md._wxgf_to_jpg(data)
-        except Exception:
-            jpg = None
-        if jpg is not None:
-            data = jpg
+            with dat_path.open("rb") as fh:
+                magic = fh.read(6)
+        except OSError as exc:
+            magic = b""
+            dat_reason = f"图片缓存读取失败：{exc}"
+
+        if not dat_reason:
+            if magic == b"\x07\x08\x56\x32\x08\x07" and not image_keys:
+                dat_reason = "V2 图片缺少解密密钥"
+            else:
+                try:
+                    data = md.decrypt_image(
+                        str(dat_path),
+                        aes_key=aes_key,
+                        xor_key=xor_key,
+                    )
+                except Exception as exc:
+                    dat_reason = f"图片解密失败：{type(exc).__name__}: {exc}"
+                else:
+                    if data[:3] == b"\xff\xd8\xff":
+                        ext = ".jpg"
+                    elif data[:4] == b"\x89PNG":
+                        ext = ".png"
+                    elif data[:3] == b"GIF":
+                        ext = ".gif"
+                    elif data[:4] == b"RIFF":
+                        ext = ".webp"
+                    elif data[:4] == b"wxgf":
+                        try:
+                            jpg = md._wxgf_to_jpg(data)
+                        except Exception:
+                            jpg = None
+                        if jpg is not None:
+                            data = jpg
+                            ext = ".jpg"
+                        else:
+                            ext = ".wxgf"
+                    else:
+                        ext = ".img"
+
+                    image_dir.mkdir(parents=True, exist_ok=True)
+                    seq = row.get("sort_seq") or local_id or "image"
+                    lid = local_id or "0"
+                    suffix = (
+                        "_thumb"
+                        if variant.startswith("thumbnail")
+                        else "_high" if variant == "high" else ""
+                    )
+                    out = image_dir / f"{seq}_{lid}{suffix}{ext}"
+                    try:
+                        out.write_bytes(data)
+                    except OSError as exc:
+                        dat_reason = f"图片写入失败：{exc}"
+                    else:
+                        return {
+                            "kind": "image",
+                            "path": str(out),
+                            "variant": variant,
+                            "previewable": ext.lower()
+                            in {".jpg", ".jpeg", ".png", ".gif", ".webp"},
+                        }, None
+
+    # 关键兜底：微信聊天缩略图缓存本身是明文 JPEG，不需要图片 AES 密钥。
+    thumb = _find_plain_thumbnail(
+        db,
+        username,
+        local_id,
+        row.get("create_time"),
+    )
+    if thumb is not None:
+        image_dir.mkdir(parents=True, exist_ok=True)
+        seq = row.get("sort_seq") or local_id or "image"
+        lid = local_id or "0"
+        ext = thumb.suffix.lower() if thumb.suffix else ".jpg"
+        if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
             ext = ".jpg"
-        else:
-            ext = ".wxgf"
-    else:
-        ext = ".img"
+        out = image_dir / f"{seq}_{lid}_thumb{ext}"
+        try:
+            shutil.copy2(thumb, out)
+        except OSError as exc:
+            return None, f"缩略图复制失败：{exc}"
+        return {
+            "kind": "image",
+            "path": str(out),
+            "variant": "thumbnail-cache",
+            "previewable": True,
+        }, None
 
-    image_dir.mkdir(parents=True, exist_ok=True)
-    seq = row.get("sort_seq") or row.get("local_id") or "image"
-    lid = row.get("local_id") or "0"
-    suffix = "_thumb" if variant == "thumbnail" else ""
-    out = image_dir / f"{seq}_{lid}{suffix}{ext}"
-
-    try:
-        out.write_bytes(data)
-    except OSError as exc:
-        return None, f"图片写入失败：{exc}"
-
-    return {
-        "kind": "image",
-        "path": str(out),
-        "variant": variant,
-        "previewable": ext.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp"},
-    }, None
+    if not file_hash:
+        return None, "未从 message_resource/消息字段解析到图片 fileHash，且无明文缩略图"
+    if dat_path is None:
+        return None, "已解析图片 fileHash，但本机 attach 目录没有对应 .dat，且无明文缩略图"
+    return None, dat_reason or "图片缓存存在但无法导出"
 
 
-def _file_name_from_row(md: MediaDownloader, row: dict, parsed_content: str) -> str:
-    media_row = {
-        "server_id": row.get("server_id"),
-    }
-    try:
-        name = md._file_name(media_row)
-    except Exception:
-        name = None
 
-    if name:
-        return safe_file_name(name, "file")
+def _file_name_candidates(
+    md: MediaDownloader,
+    row: dict,
+    parsed_content: str,
+) -> list[str]:
+    """同时使用 appmsg 标题和 message_resource 文件名，避免单一路径误判。"""
+    names = []
 
     if parsed_content.startswith("[文件]"):
-        fallback = parsed_content[len("[文件]"):].strip()
-        if fallback:
-            return safe_file_name(fallback, "file")
-    return ""
+        title = parsed_content[len("[文件]"):].strip()
+        if title:
+            names.append(safe_file_name(title, "file"))
+
+    media_row = {"server_id": row.get("server_id")}
+    try:
+        resource_name = md._file_name(media_row)
+    except Exception:
+        resource_name = None
+    if resource_name:
+        resource_name = safe_file_name(resource_name, "file")
+        if resource_name not in names:
+            names.append(resource_name)
+
+    return names
 
 
 def _copy_file_from_row(
     md: MediaDownloader,
     row: dict,
     parsed_content: str,
-    file_index: dict[str, list[Path]],
+    file_index: dict,
     file_dir: Path,
 ):
-    name = _file_name_from_row(md, row, parsed_content)
-    if not name:
-        return None, "不是可定位的本地文件，或未解析到文件名"
+    names = _file_name_candidates(md, row, parsed_content)
+    if not names:
+        return None, "未从文件消息中解析到文件名"
 
-    candidates = file_index.get(name.casefold(), [])
-    src = _pick_file_candidate(candidates, row.get("create_time"))
+    exact = file_index.get("exact", {})
+    loose = file_index.get("loose", {})
+    src = None
+    matched_name = None
+
+    # 先严格匹配；再兼容 Windows 下载重名时自动变成 xxx(1).ext。
+    for name in names:
+        candidates = exact.get(_filename_key(name), [])
+        src = _pick_file_candidate(candidates, row.get("create_time"))
+        if src is not None:
+            matched_name = name
+            break
+
     if src is None:
-        return None, f"本机没有找到文件缓存：{name}"
+        for name in names:
+            candidates = loose.get(_filename_loose_key(name), [])
+            src = _pick_file_candidate(candidates, row.get("create_time"))
+            if src is not None:
+                matched_name = src.name
+                break
+
+    if src is None:
+        shown = " / ".join(names)
+        roots = file_index.get("roots", [])
+        if not roots:
+            return None, f"没有找到微信本地文件缓存目录；消息文件名：{shown}"
+        return None, f"缓存目录中未匹配到文件：{shown}"
 
     file_dir.mkdir(parents=True, exist_ok=True)
     seq = row.get("sort_seq") or row.get("local_id") or "file"
     lid = row.get("local_id") or "0"
-    out = file_dir / f"{seq}_{lid}_{safe_file_name(name, 'file')}"
+    out_name = safe_file_name(src.name or matched_name or names[0], "file")
+    out = file_dir / f"{seq}_{lid}_{out_name}"
 
     try:
         if out.exists():
-            out = file_dir / f"{seq}_{lid}_{src.stat().st_size}_{safe_file_name(name, 'file')}"
+            out = file_dir / f"{seq}_{lid}_{src.stat().st_size}_{out_name}"
         shutil.copy2(src, out)
     except OSError as exc:
         return None, f"文件复制失败：{exc}"
@@ -632,7 +916,7 @@ def _copy_file_from_row(
     return {
         "kind": "file",
         "path": str(out),
-        "name": name,
+        "name": src.name or matched_name or names[0],
         "previewable": False,
     }, None
 
@@ -812,21 +1096,41 @@ def export_chat(
         image_index = {}
         image_keys = None
         file_index = {}
+        image_failures = Counter()
+        file_failures = Counter()
 
         if image_rows_exist:
             log("正在定位本机图片缓存…")
             image_index = _index_image_files(db, username)
+
+            # WeChatDB 命中已缓存 keys.json 时，cfg_dword 默认不会再次提取。
+            # 图片解密的稳定路径却依赖 cfg_dword，所以媒体导出时主动补取一次。
+            log("正在准备图片解密配置…")
+            cfg_dword, cfg_error = _ensure_cfg_dword(db)
+            if cfg_dword:
+                try:
+                    md._cfg_dword = cfg_dword
+                except Exception:
+                    pass
+                log("已获取图片解密配置。")
+            elif cfg_error:
+                log(f"图片解密配置暂未获取：{cfg_error}")
+
             if image_index:
-                log("正在准备图片解密…")
                 image_keys = _detect_image_keys_fast(md)
-                if not image_keys:
-                    log("未快速获取到图片解密密钥；可导出的旧格式图片仍会尝试处理。")
+                if image_keys:
+                    log("图片解密密钥已就绪。")
+                else:
+                    log("未获取到图片解密密钥；将优先回退导出微信明文缩略图。")
             else:
-                log("该会话没有找到本机图片缓存。")
+                log("该会话 attach 目录没有找到加密图片；仍会尝试明文缩略图缓存。")
 
         if file_rows_exist:
             log("正在索引本机文件缓存…")
             file_index = _index_local_files(db)
+            log(
+                f"已索引本机文件缓存：{file_index.get('count', 0)} 个文件。"
+            )
 
         image_dir = chat_dir / "media" / "images"
         file_dir = chat_dir / "media" / "files"
@@ -837,7 +1141,13 @@ def export_chat(
             if export_images and t == 3:
                 media_stats["images_requested"] += 1
                 media, reason = _write_image_from_row(
-                    md, row, username, image_index, image_dir, image_keys
+                    db,
+                    md,
+                    row,
+                    username,
+                    image_index,
+                    image_dir,
+                    image_keys,
                 )
                 if media:
                     rel = _relative_media_path(chat_dir, Path(media["path"]))
@@ -846,6 +1156,8 @@ def export_chat(
                     msg["media"] = media
                     media_stats["images_exported"] += 1
                 else:
+                    reason = reason or "未知原因"
+                    image_failures[reason] += 1
                     msg["media"] = {
                         "kind": "image",
                         "available": False,
@@ -865,6 +1177,8 @@ def export_chat(
                     msg["media"] = media
                     media_stats["files_exported"] += 1
                 else:
+                    reason = reason or "未知原因"
+                    file_failures[reason] += 1
                     msg["media"] = {
                         "kind": "file",
                         "available": False,
@@ -904,11 +1218,27 @@ def export_chat(
             f"图片：{media_stats['images_exported']}/"
             f"{media_stats['images_requested']} 已导出"
         )
+        if media_stats["images_exported"] < media_stats["images_requested"]:
+            failures = locals().get("image_failures", Counter())
+            if failures:
+                summary = "；".join(
+                    f"{count}× {reason}"
+                    for reason, count in failures.most_common(3)
+                )
+                log(f"图片未导出主要原因：{summary}")
     if export_files:
         log(
             f"文件：{media_stats['files_exported']}/"
             f"{media_stats['files_requested']} 已导出"
         )
+        if media_stats["files_exported"] < media_stats["files_requested"]:
+            failures = locals().get("file_failures", Counter())
+            if failures:
+                summary = "；".join(
+                    f"{count}× {reason}"
+                    for reason, count in failures.most_common(3)
+                )
+                log(f"文件未导出主要原因：{summary}")
 
     return {
         "chat_name": target_name,
