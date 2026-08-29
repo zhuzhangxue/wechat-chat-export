@@ -11,6 +11,7 @@ on:
       - "cli.py"
       - "exporter_core.py"
       - "requirements.txt"
+      - "assets/app.ico"
 
 jobs:
   build:
@@ -46,6 +47,7 @@ jobs:
             --onefile `
             --windowed `
             --name "WeChat-Chat-Export-for-LLM" `
+            --icon "assets/app.ico" `
             --collect-all wechatauto `
             --collect-all winsdk `
             --collect-all uiautomation `
