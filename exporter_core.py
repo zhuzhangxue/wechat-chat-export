@@ -1336,14 +1336,21 @@ SENSEVOICE_MODEL_URL = (
 SENSEVOICE_MODEL_SHA256 = "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"
 
 
-def _persistent_sensevoice_dir() -> Path:
-    """模型放在用户目录，避免 PyInstaller onefile 每次启动后丢失。"""
+def _persistent_app_data_dir() -> Path:
+    """长期数据放在用户应用数据目录，不混进导出文件夹。"""
     local_appdata = os.environ.get("LOCALAPPDATA")
     if local_appdata:
-        root = Path(local_appdata)
-    else:
-        root = Path.home() / ".wechat-chat-export-for-llm"
-    return root / "WeChat-Chat-Export-for-LLM" / "models" / "sensevoice"
+        return Path(local_appdata) / "WeChat-Chat-Export-for-LLM"
+    return Path.home() / ".wechat-chat-export-for-llm"
+
+
+def _persistent_sensevoice_dir() -> Path:
+    """模型放在用户目录，避免 PyInstaller onefile 每次启动后丢失。"""
+    return _persistent_app_data_dir() / "models" / "sensevoice"
+
+
+def _persistent_asr_cache_path() -> Path:
+    return _persistent_app_data_dir() / "cache" / "voice_asr_cache.json"
 
 
 def _find_sensevoice_model():
@@ -1562,21 +1569,47 @@ def _transcribe_wav_local(recognizer, wav_path: Path):
         return "", f"本地语音识别失败：{type(exc).__name__}: {exc}"
 
 
-def _load_asr_cache(out_root: Path):
-    path = out_root / ".voice_asr_cache.json"
+def _read_asr_cache_file(path: Path) -> dict:
     try:
         if path.exists():
             with path.open("r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                return path, {
+                return {
                     str(k): str(v)
                     for k, v in data.items()
                     if isinstance(k, str) and isinstance(v, str) and v.strip()
                 }
     except Exception:
         pass
-    return path, {}
+    return {}
+
+
+def _load_asr_cache(out_root: Path):
+    """读取长期 ASR 缓存，并兼容迁移 v1.3.0 发布前测试版的旧缓存位置。"""
+    path = _persistent_asr_cache_path()
+    cache = _read_asr_cache_file(path)
+
+    legacy_path = out_root / ".voice_asr_cache.json"
+    legacy_cache = _read_asr_cache_file(legacy_path)
+    if legacy_cache:
+        changed = False
+        for key, value in legacy_cache.items():
+            if key not in cache:
+                cache[key] = value
+                changed = True
+
+        if changed or not path.exists():
+            _save_asr_cache(path, cache)
+
+        # 成功写入新位置后再移除旧缓存，让 exports 保持干净。
+        try:
+            if path.exists():
+                legacy_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return path, cache
 
 
 def _save_asr_cache(path: Path, cache: dict):
