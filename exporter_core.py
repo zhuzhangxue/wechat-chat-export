@@ -8,6 +8,8 @@ import json
 import os
 import re
 import shutil
+import tempfile
+import subprocess
 import unicodedata
 from collections import Counter
 from datetime import datetime
@@ -17,6 +19,7 @@ import xml.etree.ElementTree as ET
 
 import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
+from PIL import Image, ImageStat
 
 APP_VERSION = "1.2.0"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
@@ -700,6 +703,165 @@ def _detect_image_keys_fast(md: MediaDownloader):
 
 
 
+
+def _wxgf_extract_units(buf: bytes):
+    starts = []
+    i = 4
+    n = len(buf)
+    while i < n - 3:
+        if buf[i:i + 4] == b"\x00\x00\x00\x01":
+            starts.append((i, 4))
+            i += 4
+            continue
+        if buf[i:i + 3] == b"\x00\x00\x01":
+            starts.append((i, 3))
+            i += 3
+            continue
+        i += 1
+
+    units = []
+    for k, (start, prefix_len) in enumerate(starts):
+        end = starts[k + 1][0] if k + 1 < len(starts) else n
+        payload = buf[start + prefix_len:end]
+        if len(payload) < 2:
+            continue
+        if payload[0] & 0x80:
+            continue
+        units.append(payload)
+    return units
+
+
+def _wxgf_nal_type(unit: bytes) -> int:
+    return (unit[0] >> 1) & 0x3F if len(unit) >= 2 else -1
+
+
+def _wxgf_merge_units(units) -> bytes:
+    return b"".join(b"\x00\x00\x00\x01" + u for u in units if len(u) >= 2)
+
+
+def _wxgf_candidates(buf: bytes):
+    units = _wxgf_extract_units(buf)
+    candidates = []
+
+    def add(name, data):
+        if not data or len(data) < 100:
+            return
+        if any(existing == data for _, existing in candidates):
+            return
+        candidates.append((name, data))
+
+    vps_starts = [i for i, u in enumerate(units) if _wxgf_nal_type(u) == 32]
+    groups = []
+    for gi, start in enumerate(vps_starts):
+        end = vps_starts[gi + 1] if gi + 1 < len(vps_starts) else len(units)
+        group_units = units[start:end]
+        if not group_units:
+            continue
+        if not any(_wxgf_nal_type(u) in {1, 19, 20} for u in group_units):
+            continue
+        merged = _wxgf_merge_units(group_units)
+        groups.append((gi, merged))
+
+    groups.sort(key=lambda x: len(x[1]), reverse=True)
+    for gi, data in groups:
+        add(f"group_{gi}", data)
+
+    add("scan_all_nalus", _wxgf_merge_units(units))
+    add("raw_skip4", buf[4:])
+    return candidates
+
+
+def _subprocess_no_window():
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = 0
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
+
+
+def _jpeg_quality_score(path: Path):
+    try:
+        with Image.open(path) as im:
+            im.load()
+            rgb = im.convert("RGB")
+            rgb.thumbnail((256, 256))
+            stat = ImageStat.Stat(rgb)
+            contrast = sum(stat.stddev) / 3.0
+            gray = rgb.convert("L")
+            hist = gray.histogram()
+            total = max(1, sum(hist))
+            near_white = sum(hist[250:256]) / total
+            near_black = sum(hist[0:6]) / total
+            uniform = max(near_white, near_black)
+            blank = contrast < 2.0 and uniform > 0.985
+            score = contrast + (1.0 - uniform) * 50.0
+            return score, blank
+    except Exception:
+        return -1.0, True
+
+
+def _wxgf_to_jpg_robust(data: bytes):
+    if data[:4] != b"wxgf":
+        return None
+
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+    best = None
+    best_score = -1.0
+
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        for idx, (_name, candidate) in enumerate(_wxgf_candidates(data)):
+            src = td_path / f"in_{idx}.hevc"
+            dst = td_path / f"out_{idx}.jpg"
+            try:
+                src.write_bytes(candidate)
+                r = subprocess.run(
+                    [
+                        exe, "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "hevc", "-i", str(src),
+                        "-vframes", "1", "-q:v", "2",
+                        "-f", "image2", str(dst),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=30,
+                    **_subprocess_no_window(),
+                )
+            except Exception:
+                continue
+
+            if r.returncode != 0 or not dst.exists() or dst.stat().st_size == 0:
+                continue
+
+            score, blank = _jpeg_quality_score(dst)
+            if blank:
+                continue
+
+            try:
+                jpg = dst.read_bytes()
+            except OSError:
+                continue
+
+            if jpg[:3] != b"\xff\xd8\xff":
+                continue
+
+            if score > best_score:
+                best_score = score
+                best = jpg
+
+    return best
+
+
+
 def _write_image_from_row(
     db: WeChatDB,
     md: MediaDownloader,
@@ -796,7 +958,7 @@ def _write_image_from_row(
                                     "previewable": True,
                                 }, None
                         try:
-                            jpg = md._wxgf_to_jpg(data)
+                            jpg = _wxgf_to_jpg_robust(data)
                         except Exception:
                             jpg = None
                         if jpg is not None:
