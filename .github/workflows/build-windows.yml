@@ -10,7 +10,10 @@ on:
       - "app.py"
       - "cli.py"
       - "exporter_core.py"
+      - "preview.py"
       - "requirements.txt"
+      - "README.md"
+      - "THIRD_PARTY_NOTICES.md"
       - "assets/app.ico"
 
 jobs:
@@ -30,13 +33,35 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller zstandard
-          python -m pip install "https://github.com/fanyuantaier/wechatauto-replica/archive/04ef8cbde3862cff90b5f6b42c9ebfcea44ef48d.zip"
+          python -m pip install pyinstaller
+          python -m pip install -r requirements.txt
+
+      - name: Download pinned rust-silk
+        shell: pwsh
+        run: |
+          $url = "https://github.com/Wangnov/rust-silk/releases/download/v0.1.3/rust-silk-x86_64-pc-windows-msvc.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "rust-silk.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+
+          $expected = "44A01BC0F3EC3EC6F6044B656869B0DD7C298329D12F07C7F7A846BE72A89504"
+          $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actual -ne $expected) {
+            throw "rust-silk SHA256 mismatch. Expected $expected, got $actual"
+          }
+
+          $extract = Join-Path $env:RUNNER_TEMP "rust-silk"
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $exe = Get-ChildItem -Path $extract -Filter "rust-silk.exe" -Recurse | Select-Object -First 1
+          if (-not $exe) {
+            throw "rust-silk.exe was not found in the release archive"
+          }
+          New-Item -ItemType Directory -Path "tools" -Force | Out-Null
+          Copy-Item $exe.FullName "tools\\rust-silk.exe" -Force
 
       - name: Syntax check
         shell: pwsh
         run: |
-          python -m py_compile app.py cli.py exporter_core.py
+          python -m py_compile app.py cli.py exporter_core.py preview.py
 
       - name: Build GUI EXE
         shell: pwsh
@@ -52,17 +77,21 @@ jobs:
             --collect-all winsdk `
             --collect-all uiautomation `
             --collect-all comtypes `
+            --collect-all imageio_ffmpeg `
+            --collect-all sherpa_onnx `
+            --collect-all soundfile `
             --hidden-import win32timezone `
+            --add-binary "tools/rust-silk.exe;tools" `
             app.py
 
       - name: Prepare package
         shell: pwsh
         run: |
-          Copy-Item README.md dist\
-          Copy-Item THIRD_PARTY_NOTICES.md dist\
+          Copy-Item README.md dist\\
+          Copy-Item THIRD_PARTY_NOTICES.md dist\\
           Compress-Archive `
-            -Path dist\WeChat-Chat-Export-for-LLM.exe,dist\README.md,dist\THIRD_PARTY_NOTICES.md `
-            -DestinationPath dist\WeChat-Chat-Export-for-LLM-Windows.zip `
+            -Path dist\\WeChat-Chat-Export-for-LLM.exe,dist\\README.md,dist\\THIRD_PARTY_NOTICES.md `
+            -DestinationPath dist\\WeChat-Chat-Export-for-LLM-Windows.zip `
             -Force
 
       - name: Upload Windows build
