@@ -767,6 +767,34 @@ def _write_image_from_row(
                     elif data[:4] == b"RIFF":
                         ext = ".webp"
                     elif data[:4] == b"wxgf":
+                        # 微信 4.x 的 wxgf/HEVC 图片直接取“第一帧”有时会得到纯白图。
+                        # 优先使用微信自己已经生成的明文聊天缩略图，稳定性更高，
+                        # 且足够用于 Markdown 直接预览；只有没有缩略图时才尝试 ffmpeg。
+                        plain_thumb = _find_plain_thumbnail(
+                            db,
+                            username,
+                            local_id,
+                            row.get("create_time"),
+                        )
+                        if plain_thumb is not None:
+                            image_dir.mkdir(parents=True, exist_ok=True)
+                            seq = row.get("sort_seq") or local_id or "image"
+                            lid = local_id or "0"
+                            thumb_ext = plain_thumb.suffix.lower() if plain_thumb.suffix else ".jpg"
+                            if thumb_ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+                                thumb_ext = ".jpg"
+                            out = image_dir / f"{seq}_{lid}_thumb{thumb_ext}"
+                            try:
+                                shutil.copy2(plain_thumb, out)
+                            except OSError as exc:
+                                dat_reason = f"wxgf 缩略图复制失败：{exc}"
+                            else:
+                                return {
+                                    "kind": "image",
+                                    "path": str(out),
+                                    "variant": "thumbnail-cache",
+                                    "previewable": True,
+                                }, None
                         try:
                             jpg = md._wxgf_to_jpg(data)
                         except Exception:
@@ -994,7 +1022,7 @@ def _write_markdown(
             if media.get("kind") == "image":
                 if media.get("previewable"):
                     alt = "图片"
-                    if media.get("variant") == "thumbnail":
+                    if str(media.get("variant") or "").startswith("thumbnail"):
                         alt = "图片（缩略图）"
                     f.write(f"![{alt}]({href})\n\n")
                 else:
