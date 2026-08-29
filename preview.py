@@ -27,7 +27,10 @@ class ChatPreview(tk.Toplevel):
         self.chat_name = data.get("chat_name") or self.chat_dir.name
         self.messages = data.get("messages") or []
         self.start_index = max(0, len(self.messages) - self.PAGE_SIZE)
-        self.photo_refs = []
+
+        # Thumbnail cache avoids decoding the same image again when loading older pages.
+        self.image_cache = {}
+        self.embedded_widgets = []
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -41,163 +44,233 @@ class ChatPreview(tk.Toplevel):
             text=self.chat_name,
             font=("Microsoft YaHei UI", 14, "bold"),
         ).grid(row=0, column=0, sticky="w")
-        self.count_label = ttk.Label(top, text="")
-        self.count_label.grid(row=0, column=1, sticky="e", padx=(10, 0))
+
+        controls = ttk.Frame(top)
+        controls.grid(row=0, column=1, sticky="e")
+
+        self.load_btn = ttk.Button(
+            controls,
+            text="加载更早消息",
+            command=self._load_older,
+        )
+        self.load_btn.pack(side="left", padx=(0, 12))
+
+        self.count_label = ttk.Label(controls, text="")
+        self.count_label.pack(side="left")
 
         body = ttk.Frame(self)
         body.grid(row=1, column=0, sticky="nsew")
         body.grid_rowconfigure(0, weight=1)
         body.grid_columnconfigure(0, weight=1)
 
-        self.canvas = tk.Canvas(body, highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
+        # Use a native Text widget instead of hundreds of nested Frames on a Canvas.
+        # It scrolls much more smoothly for long chats and avoids transparent ttk
+        # areas exposing a black Canvas background on some Windows themes.
+        bg = self.cget("background")
+        self.text = tk.Text(
+            body,
+            wrap="word",
+            undo=False,
+            borderwidth=0,
+            highlightthickness=0,
+            relief="flat",
+            background=bg,
+            foreground="black",
+            insertbackground="black",
+            padx=22,
+            pady=12,
+            spacing1=0,
+            spacing2=0,
+            spacing3=0,
+            cursor="arrow",
+        )
+        self.scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=self.scrollbar.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
         self.scrollbar.grid(row=0, column=1, sticky="ns")
 
-        self.inner = ttk.Frame(self.canvas, padding=(18, 10, 18, 18))
-        self.inner_window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        self.inner.bind("<Configure>", self._on_inner_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self._configure_tags()
 
         self.protocol("WM_DELETE_WINDOW", self._close)
         self._render()
-        self.after(80, lambda: self.canvas.yview_moveto(1.0))
+        self.after(80, lambda: self.text.yview_moveto(1.0))
+
+    def _configure_tags(self):
+        self.text.tag_configure(
+            "date",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            justify="center",
+            spacing1=14,
+            spacing3=8,
+        )
+        self.text.tag_configure(
+            "sender",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            spacing1=10,
+            spacing3=3,
+        )
+        self.text.tag_configure(
+            "content",
+            font=("Microsoft YaHei UI", 10),
+            lmargin1=0,
+            lmargin2=0,
+            spacing3=4,
+        )
+        self.text.tag_configure(
+            "transcript",
+            font=("Microsoft YaHei UI", 9),
+            foreground="#555555",
+            lmargin1=16,
+            lmargin2=16,
+            spacing3=4,
+        )
+        self.text.tag_configure(
+            "separator",
+            foreground="#A8A8A8",
+            spacing1=4,
+            spacing3=4,
+        )
 
     def _close(self):
-        try:
-            self.canvas.unbind_all("<MouseWheel>")
-        except Exception:
-            pass
+        self.image_cache.clear()
+        self.embedded_widgets.clear()
         self.destroy()
 
-    def _on_inner_configure(self, _event=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _on_canvas_configure(self, event):
-        self.canvas.itemconfigure(self.inner_window, width=event.width)
-
-    def _on_mousewheel(self, event):
-        self.canvas.yview_scroll(int(-event.delta / 120), "units")
-
-    def _clear(self):
-        for child in self.inner.winfo_children():
-            child.destroy()
-        self.photo_refs.clear()
+    def _set_editable(self, editable: bool):
+        self.text.configure(state="normal" if editable else "disabled")
 
     def _render(self):
-        self._clear()
+        # Rebuilding a Text document is cheap even for hundreds/thousands of
+        # normal text messages, unlike rebuilding thousands of nested widgets.
+        self._set_editable(True)
+        self.text.delete("1.0", "end")
+        self.embedded_widgets.clear()
+
         shown = len(self.messages) - self.start_index
         self.count_label.configure(text=f"显示 {shown}/{len(self.messages)} 条")
 
-        if self.start_index > 0:
-            ttk.Button(
-                self.inner,
-                text=f"加载更早 {min(self.PAGE_SIZE, self.start_index)} 条消息",
-                command=self._load_older,
-            ).pack(pady=(0, 14))
+        remaining = self.start_index
+        if remaining > 0:
+            n = min(self.PAGE_SIZE, remaining)
+            self.load_btn.configure(
+                state="normal",
+                text=f"加载更早 {n} 条消息",
+            )
+        else:
+            self.load_btn.configure(
+                state="disabled",
+                text="已加载全部消息",
+            )
 
         last_date = None
         for msg in self.messages[self.start_index:]:
             time_text = str(msg.get("time") or "")
             date = time_text[:10] if len(time_text) >= 10 else ""
             if date and date != last_date:
-                ttk.Label(
-                    self.inner,
-                    text=date,
-                    font=("Microsoft YaHei UI", 10, "bold"),
-                ).pack(pady=(10, 8))
+                if self.text.index("end-1c") != "1.0":
+                    self.text.insert("end", "\n")
+                self.text.insert("end", f"{date}\n", "date")
                 last_date = date
             self._render_message(msg)
 
+        self._set_editable(False)
+
     def _load_older(self):
+        if self.start_index <= 0:
+            return
         self.start_index = max(0, self.start_index - self.PAGE_SIZE)
         self._render()
-        self.after(50, lambda: self.canvas.yview_moveto(0.0))
+        # New page starts at the top so the newly loaded older messages are visible.
+        self.after_idle(lambda: self.text.yview_moveto(0.0))
 
     def _render_message(self, msg):
-        card = ttk.Frame(self.inner, padding=(10, 8))
-        card.pack(fill="x", pady=4)
-
         time_text = str(msg.get("time") or "")
         time_only = time_text[11:19] if len(time_text) >= 19 else time_text
         sender = msg.get("sender") or "未知"
-        ttk.Label(
-            card,
-            text=f"{time_only} | {sender}",
-            font=("Microsoft YaHei UI", 10, "bold"),
-        ).pack(anchor="w")
+
+        self.text.insert("end", f"{time_only} | {sender}\n", "sender")
 
         content = str(msg.get("content") or "")
         if content and content not in {"[图片]", "[语音]", "[视频]"}:
-            ttk.Label(
-                card,
-                text=content,
-                justify="left",
-                wraplength=760,
-            ).pack(anchor="w", pady=(4, 2))
+            self.text.insert("end", content.rstrip() + "\n", "content")
 
         media = msg.get("media") or {}
         if media.get("available") and media.get("path"):
             full = self.chat_dir / Path(media["path"])
             kind = media.get("kind")
             if kind == "image":
-                self._render_image(card, full)
+                self._render_image(full)
             elif kind == "file":
                 label = media.get("name") or full.name
-                ttk.Button(
-                    card,
-                    text=f"打开文件：{label}",
-                    command=lambda p=full: self._open_path(p),
-                ).pack(anchor="w", pady=(5, 2))
+                self._insert_button(
+                    f"打开文件：{label}",
+                    lambda p=full: self._open_path(p),
+                )
             elif kind == "voice":
                 label = "播放语音" if full.suffix.lower() == ".wav" else "打开语音文件"
-                ttk.Button(
-                    card,
-                    text=label,
-                    command=lambda p=full: self._open_path(p),
-                ).pack(anchor="w", pady=(5, 2))
+                self._insert_button(
+                    label,
+                    lambda p=full: self._open_path(p),
+                )
             elif kind == "video":
-                ttk.Button(
-                    card,
-                    text="播放视频",
-                    command=lambda p=full: self._open_path(p),
-                ).pack(anchor="w", pady=(5, 2))
+                self._insert_button(
+                    "播放视频",
+                    lambda p=full: self._open_path(p),
+                )
 
         transcript = msg.get("transcript") or media.get("transcript")
         if transcript:
             source = msg.get("transcript_source") or media.get("transcript_source")
             label = "语音转文字（本地识别）" if source == "local_asr" else "语音转文字"
-            ttk.Label(
-                card,
-                text=f"{label}：{transcript}",
-                justify="left",
-                wraplength=760,
-            ).pack(anchor="w", pady=(4, 2))
+            self.text.insert(
+                "end",
+                f"{label}：{transcript}\n",
+                "transcript",
+            )
 
-        ttk.Separator(card).pack(fill="x", pady=(8, 0))
+        # A lightweight text separator avoids creating one widget per message.
+        self.text.insert("end", "─" * 92 + "\n", "separator")
 
-    def _render_image(self, parent, path: Path):
+    def _insert_button(self, text, command):
+        button = ttk.Button(self.text, text=text, command=command)
+        self.embedded_widgets.append(button)
+        self.text.window_create("end", window=button, padx=0, pady=4)
+        self.text.insert("end", "\n")
+
+    def _render_image(self, path: Path):
         if not path.exists():
-            ttk.Label(parent, text="[图片文件不存在]").pack(anchor="w", pady=4)
+            self.text.insert("end", "[图片文件不存在]\n", "content")
             return
-        try:
-            with Image.open(path) as im:
-                image = im.convert("RGB")
-                image.thumbnail((600, 420), Image.Resampling.LANCZOS)
-                photo = ImageTk.PhotoImage(image)
-        except Exception:
-            ttk.Button(
-                parent,
-                text="打开图片",
-                command=lambda p=path: self._open_path(p),
-            ).pack(anchor="w", pady=4)
-            return
-        self.photo_refs.append(photo)
-        label = ttk.Label(parent, image=photo, cursor="hand2")
-        label.pack(anchor="w", pady=(6, 2))
+
+        key = str(path.resolve()).lower()
+        photo = self.image_cache.get(key)
+        if photo is None:
+            try:
+                with Image.open(path) as im:
+                    image = im.convert("RGB")
+                    image.thumbnail((600, 420), Image.Resampling.LANCZOS)
+                    photo = ImageTk.PhotoImage(image)
+                self.image_cache[key] = photo
+            except Exception:
+                self._insert_button(
+                    "打开图片",
+                    lambda p=path: self._open_path(p),
+                )
+                return
+
+        # Only image messages create a small widget; normal text messages no longer do.
+        label = tk.Label(
+            self.text,
+            image=photo,
+            borderwidth=0,
+            highlightthickness=0,
+            cursor="hand2",
+            background=self.text.cget("background"),
+        )
         label.bind("<Button-1>", lambda _e, p=path: self._open_path(p))
+        self.embedded_widgets.append(label)
+        self.text.window_create("end", window=label, padx=0, pady=5)
+        self.text.insert("end", "\n")
 
     def _open_path(self, path: Path):
         if not path.exists():
