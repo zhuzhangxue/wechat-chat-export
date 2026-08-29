@@ -1,0 +1,73 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-windows.yml"
+      - "app.py"
+      - "cli.py"
+      - "exporter_core.py"
+      - "requirements.txt"
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller zstandard
+          python -m pip install "https://github.com/fanyuantaier/wechatauto-replica/archive/04ef8cbde3862cff90b5f6b42c9ebfcea44ef48d.zip"
+
+      - name: Syntax check
+        shell: pwsh
+        run: |
+          python -m py_compile app.py cli.py exporter_core.py
+
+      - name: Build GUI EXE
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name "WeChat-Chat-Export-for-LLM" `
+            --collect-all wechatauto `
+            --collect-all winsdk `
+            --collect-all uiautomation `
+            --collect-all comtypes `
+            --hidden-import win32timezone `
+            app.py
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          Copy-Item README.md dist\
+          Copy-Item THIRD_PARTY_NOTICES.md dist\
+          Compress-Archive `
+            -Path dist\WeChat-Chat-Export-for-LLM.exe,dist\README.md,dist\THIRD_PARTY_NOTICES.md `
+            -DestinationPath dist\WeChat-Chat-Export-for-LLM-Windows.zip `
+            -Force
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChat-Chat-Export-for-LLM-Windows
+          path: |
+            dist/WeChat-Chat-Export-for-LLM.exe
+            dist/WeChat-Chat-Export-for-LLM-Windows.zip
+          if-no-files-found: error
