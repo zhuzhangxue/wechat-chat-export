@@ -88,9 +88,10 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item README.md dist\\
+          Copy-Item LICENSE dist\\
           Copy-Item THIRD_PARTY_NOTICES.md dist\\
           Compress-Archive `
-            -Path dist\\WeChat-Chat-Export-for-LLM.exe,dist\\README.md,dist\\THIRD_PARTY_NOTICES.md `
+            -Path dist\\WeChat-Chat-Export-for-LLM.exe,dist\\README.md,dist\\LICENSE,dist\\THIRD_PARTY_NOTICES.md `
             -DestinationPath dist\\WeChat-Chat-Export-for-LLM-Windows.zip `
             -Force
 
@@ -101,4 +102,6 @@ jobs:
           path: |
             dist/WeChat-Chat-Export-for-LLM.exe
             dist/WeChat-Chat-Export-for-LLM-Windows.zip
+            dist/LICENSE
+            dist/THIRD_PARTY_NOTICES.md
           if-no-files-found: error
