@@ -53,7 +53,7 @@ exports/
 
 ## 下载和构建
 
-稳定发布包放在 [Releases](https://github.com/zhuzhangxue/wechat-chat-export-for-llm/releases)。如果 Releases 里的版本暂时落后于源码，也可以到 [Actions](https://github.com/zhuzhangxue/wechat-chat-export-for-llm/actions) 下载最新一次 `Build Windows EXE` 的 artifact。
+稳定发布包放在 [Releases](https://github.com/zhuzhangxue/wechat-chat-export/releases)。如果 Releases 里的版本暂时落后于源码，也可以到 [Actions](https://github.com/zhuzhangxue/wechat-chat-export/actions) 下载最新一次 `Build Windows EXE` 的 artifact。
 
 当前 EXE 没有商业代码签名证书，第一次运行可能遇到 Windows SmartScreen 提示。仓库源码和 GitHub Actions 构建脚本都是公开的；不想运行未签名程序的话，可以直接从源码运行或自己构建。没必要为了这个工具关闭 Defender、SmartScreen，也不建议给目录加安全软件排除项。
 
