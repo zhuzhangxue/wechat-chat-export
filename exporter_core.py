@@ -58,14 +58,24 @@ def resolve_db_dir(path) -> str:
     if not base.is_dir():
         raise ValueError(f"微信数据目录不存在：{base}")
 
+    last_error = None
     for cand in [base] + [base / name for name in WECHAT_DATA_SUBDIRS]:
         if not cand.is_dir():
             continue
         try:
             if any((child / "db_storage").is_dir() for child in cand.iterdir()):
                 return str(cand)
-        except OSError:
+        except OSError as exc:
+            # 记下来，等所有候选都试完再决定报哪个错：目录读不动和目录里
+            # 确实没有账号数据是两回事，混成一句会让排障走弯路。
+            last_error = exc
             continue
+
+    if last_error is not None:
+        raise ValueError(
+            f"读取 {base} 时出错：{last_error}。"
+            "请确认对该目录有读取权限，且目录没有被占用或断开连接。"
+        ) from last_error
 
     raise ValueError(
         f"在 {base} 下没有找到微信账号数据（<账号>/db_storage）。"
