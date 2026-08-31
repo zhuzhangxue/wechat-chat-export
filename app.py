@@ -14,6 +14,7 @@ import psutil
 
 from exporter_core import export_chat, install_local_asr_model, local_asr_status
 from preview import open_chat_preview
+from wechat_data_dirs import choose_wechat_data_dir
 
 APP_TITLE = "微信聊天导出给大模型"
 WECHAT_PROCESS_NAMES = {"weixin.exe", "wechat.exe"}
@@ -123,7 +124,7 @@ class App(tk.Tk):
         )
         ttk.Label(
             dbrow,
-            text="留空自动探测；数据目录迁移过、或导出结果停在旧时间点时在此指定。",
+            text="留空自动探测；点“选择”可列出本机发现的微信数据目录，也可手动浏览。",
             foreground="#6b7280",
         ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(2, 0))
 
@@ -199,11 +200,21 @@ class App(tk.Tk):
             self.voices_var.set(True)
 
     def choose_db_dir(self):
-        path = filedialog.askdirectory(
-            initialdir=self.db_dir_var.get() or str(app_dir())
-        )
+        self.log("正在查找本机微信数据目录……")
+        try:
+            path = choose_wechat_data_dir(
+                self,
+                current=self.db_dir_var.get().strip() or None,
+            )
+        except Exception as exc:
+            self.log(f"查找微信数据目录失败：{type(exc).__name__}: {exc}")
+            path = filedialog.askdirectory(
+                parent=self,
+                initialdir=self.db_dir_var.get() or str(Path.home()),
+            )
         if path:
             self.db_dir_var.set(path)
+            self.log(f"已选择微信数据目录：{path}")
 
     def choose_out(self):
         path = filedialog.askdirectory(
