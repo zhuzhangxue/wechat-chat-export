@@ -14,6 +14,7 @@ import sys
 import tarfile
 import unicodedata
 import urllib.request
+import zipfile
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -24,8 +25,16 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+RUST_SILK_URL = (
+    "https://github.com/Wangnov/rust-silk/releases/download/v0.1.3/"
+    "rust-silk-x86_64-pc-windows-msvc.zip"
+)
+RUST_SILK_ZIP_SHA256 = (
+    "44a01bc0f3ec3ec6f6044b656869b0dd7c298329d12f07c7f7a846be72a89504"
+)
 
 TYPE_LABEL = {
     1: "文本",
@@ -1300,12 +1309,79 @@ def _find_rust_silk() -> Path | None:
     candidates = [
         _runtime_resource("tools", "rust-silk.exe"),
         Path(__file__).resolve().parent / "tools" / "rust-silk.exe",
+        _persistent_app_data_dir() / "tools" / "rust-silk.exe",
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
     found = shutil.which("rust-silk")
     return Path(found) if found else None
+
+
+def rust_silk_status():
+    exe = _find_rust_silk()
+    if exe is None:
+        return False, "未找到 rust-silk 语音解码器"
+    return True, str(exe)
+
+
+def install_rust_silk(progress=None):
+    """从官方 Release 下载固定版本 rust-silk，并校验压缩包 SHA-256。"""
+    def log(message):
+        if progress:
+            progress(message)
+
+    if os.name != "nt":
+        raise RuntimeError("rust-silk 自动安装目前只支持 Windows")
+
+    existing = _find_rust_silk()
+    if existing is not None:
+        log(f"rust-silk 已存在：{existing}")
+        return str(existing)
+
+    target = _persistent_app_data_dir() / "tools" / "rust-silk.exe"
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="wechat-chat-export-rust-silk-") as td:
+        td = Path(td)
+        archive = td / "rust-silk.zip"
+        extracted = td / "rust-silk.exe"
+
+        log("正在从官方 GitHub Release 下载 rust-silk v0.1.3…")
+        request = urllib.request.Request(
+            RUST_SILK_URL,
+            headers={"User-Agent": f"WeChat-Chat-Export-for-LLM/{APP_VERSION}"},
+        )
+        with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as f:
+            shutil.copyfileobj(response, f)
+
+        actual = _sha256_file(archive).lower()
+        if actual != RUST_SILK_ZIP_SHA256:
+            raise RuntimeError(
+                "rust-silk SHA-256 校验失败。"
+                f"期望 {RUST_SILK_ZIP_SHA256}，实际 {actual}"
+            )
+        log("rust-silk 下载完成，SHA-256 校验通过。")
+
+        with zipfile.ZipFile(archive, "r") as zf:
+            member = next(
+                (
+                    name for name in zf.namelist()
+                    if Path(name).name.lower() == "rust-silk.exe"
+                ),
+                None,
+            )
+            if member is None:
+                raise RuntimeError("下载包里没有找到 rust-silk.exe")
+            with zf.open(member) as src, extracted.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
+
+        temp_target = target.with_suffix(".exe.tmp")
+        shutil.copy2(extracted, temp_target)
+        os.replace(temp_target, target)
+
+    log(f"rust-silk 已安装：{target}")
+    return str(target)
 
 
 def _decode_silk_to_wav(silk_path: Path, wav_path: Path):

@@ -4,7 +4,7 @@
 
 如果这个工具对你有帮助，欢迎点个 Star。
 
-目前源码版本：**v1.3.1**
+目前源码版本：**v1.3.2**
 
 支持私聊和群聊，可处理文字、长文本、引用回复、系统消息，并尽量导出本机仍有缓存的图片、文件、语音和视频。
 
@@ -57,6 +57,8 @@ exports/
 - `JSON`：保留更多结构，适合脚本和二次开发。
 
 程序还带有简单的聊天预览，可以直接查看文字和图片，并通过 Windows 默认程序打开文件、语音和视频。
+
+导出成功后可以直接点击「打开聊天预览」查看刚刚导出的聊天；「预览已有聊天」则始终可用，可以随时选择以前的聊天导出文件夹重新打开预览。
 
 ## 微信数据目录
 
@@ -181,11 +183,21 @@ python cli.py "好友备注名或群名" --transcribe-voices
 
 ### 源码运行时的语音解码
 
-仓库不会直接提交 `rust-silk.exe` 这个第三方二进制文件。
+仓库不会直接提交 `rust-silk.exe` 这个第三方二进制文件。需要时会从 `rust-silk` 官方 Release 获取固定版本，并校验 SHA-256。
 
-因此直接运行源码时，如果本机没有 `rust-silk`，语音仍然可以导出为 SILK，但不能转换为 WAV，也无法继续做本地语音转文字。
+直接运行 GUI 源码时，如果第一次使用语音功能而本机没有 `rust-silk`，程序会询问是否自动下载。确认后会下载固定的 v0.1.3，并保存到：
 
-开发测试时可以把 `rust-silk.exe` 放在：
+```text
+%LOCALAPPDATA%\WeChat-Chat-Export-for-LLM\tools\rust-silk.exe
+```
+
+命令行也可以先安装：
+
+```powershell
+python cli.py --install-rust-silk
+```
+
+也可以自己准备 `rust-silk.exe`，放在：
 
 ```text
 wechat-chat-export\
@@ -193,7 +205,9 @@ wechat-chat-export\
    └─ rust-silk.exe
 ```
 
-正式 Windows EXE 会在 GitHub Actions 构建时自动下载并打包该工具，普通用户不需要自己准备。
+如果没有安装或手动准备，语音仍可以导出为 SILK，但不能转换为 WAV，也无法继续做本地语音转文字。
+
+正式 Windows EXE 会在 GitHub Actions 构建时自动下载并打包 `rust-silk`，普通用户不需要额外安装。
 
 ## Windows 构建
 

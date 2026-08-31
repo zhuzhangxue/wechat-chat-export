@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import argparse
 
-from exporter_core import export_chat, install_local_asr_model
+from exporter_core import export_chat, install_local_asr_model, install_rust_silk
 
 
 if __name__ == "__main__":
@@ -36,6 +36,11 @@ if __name__ == "__main__":
         help="下载安装本地 SenseVoice 语音识别模型后退出",
     )
     p.add_argument(
+        "--install-rust-silk",
+        action="store_true",
+        help="下载安装 rust-silk 语音解码器后退出",
+    )
+    p.add_argument(
         "--db-dir",
         default=None,
         help=(
@@ -48,8 +53,14 @@ if __name__ == "__main__":
     if a.install_asr:
         install_local_asr_model(progress=print)
         raise SystemExit(0)
+    if a.install_rust_silk:
+        install_rust_silk(progress=print)
+        raise SystemExit(0)
     if not a.name:
-        p.error("请提供好友备注/昵称或群名；或使用 --install-asr")
+        p.error(
+            "请提供好友备注/昵称或群名；"
+            "或使用 --install-asr / --install-rust-silk"
+        )
 
     result = export_chat(
         a.name,

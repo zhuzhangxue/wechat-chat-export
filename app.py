@@ -12,7 +12,13 @@ from tkinter import filedialog, messagebox, ttk
 
 import psutil
 
-from exporter_core import export_chat, install_local_asr_model, local_asr_status
+from exporter_core import (
+    export_chat,
+    install_local_asr_model,
+    install_rust_silk,
+    local_asr_status,
+    rust_silk_status,
+)
 from preview import open_chat_preview
 from wechat_data_dirs import choose_wechat_data_dir
 
@@ -176,13 +182,22 @@ class App(tk.Tk):
         bottom.grid(row=10, column=0, sticky="ew", pady=(10, 0))
         bottom.grid_columnconfigure(0, weight=1)
 
+        self.existing_preview_btn = ttk.Button(
+            bottom,
+            text="预览已有聊天",
+            command=self.open_existing_preview,
+        )
+        self.existing_preview_btn.grid(
+            row=0, column=1, sticky="e", padx=(0, 8)
+        )
+
         self.preview_btn = ttk.Button(
             bottom,
             text="打开聊天预览",
             command=self.open_preview,
             state="disabled",
         )
-        self.preview_btn.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.preview_btn.grid(row=0, column=2, sticky="e", padx=(0, 8))
 
         self.open_btn = ttk.Button(
             bottom,
@@ -190,7 +205,7 @@ class App(tk.Tk):
             command=self.open_output,
             state="disabled",
         )
-        self.open_btn.grid(row=0, column=2, sticky="e")
+        self.open_btn.grid(row=0, column=3, sticky="e")
 
         self.entry.focus_set()
         self.after(100, self.poll_queue)
@@ -247,6 +262,37 @@ class App(tk.Tk):
         transcribe_voices = self.transcribe_var.get()
         if transcribe_voices:
             self.voices_var.set(True)
+
+        if self.voices_var.get():
+            ok, reason = rust_silk_status()
+            if not ok:
+                install_now = messagebox.askyesno(
+                    APP_TITLE,
+                    "当前没有找到 rust-silk 语音解码器。\n\n"
+                    "微信语音需要它才能从 SILK 转成 WAV；"
+                    "本地语音转文字也需要先得到 WAV。\n\n"
+                    "程序会从 rust-silk 官方 GitHub Release 下载固定的 v0.1.3，"
+                    "并在安装前校验 SHA-256。\n\n"
+                    "现在下载并安装吗？",
+                )
+                if install_now:
+                    self.export_btn.configure(state="disabled")
+                    self.log("")
+                    self.log("开始安装 rust-silk 语音解码器…")
+                    threading.Thread(
+                        target=self.install_rust_silk_worker,
+                        daemon=True,
+                    ).start()
+                    return
+                if transcribe_voices:
+                    messagebox.showwarning(
+                        APP_TITLE,
+                        "未安装 rust-silk，无法把 SILK 转成 WAV，"
+                        "因此不能继续本地语音转文字。",
+                    )
+                    return
+
+        if transcribe_voices:
             ok, reason = local_asr_status()
             if not ok:
                 if reason.startswith("本地语音识别运行库不可用"):
@@ -309,6 +355,15 @@ class App(tk.Tk):
             self.q.put(("asr_installed", None))
         except Exception as exc:
             self.q.put(("asr_error", f"{type(exc).__name__}: {exc}"))
+
+    def install_rust_silk_worker(self):
+        try:
+            install_rust_silk(
+                progress=lambda m: self.q.put(("log", m))
+            )
+            self.q.put(("rust_silk_installed", None))
+        except Exception as exc:
+            self.q.put(("rust_silk_error", f"{type(exc).__name__}: {exc}"))
 
     def worker(
         self,
@@ -385,6 +440,17 @@ class App(tk.Tk):
                         "本地语音识别模型安装完成。\n\n"
                         "现在可以重新点击“开始导出”。",
                     )
+                elif kind == "rust_silk_installed":
+                    self.export_btn.configure(state="normal")
+                    self.log("rust-silk 安装完成，继续导出。")
+                    self.after(0, self.start_export)
+                elif kind == "rust_silk_error":
+                    self.export_btn.configure(state="normal")
+                    self.log("rust-silk 安装失败：" + payload)
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "rust-silk 安装失败：\n\n" + payload,
+                    )
                 elif kind == "asr_error":
                     self.export_btn.configure(state="normal")
                     self.log("本地语音识别模型安装失败：" + payload)
@@ -408,8 +474,34 @@ class App(tk.Tk):
         if not self.last_result:
             return
         json_path = self.last_result.get("json")
-        if json_path:
+        if json_path and Path(json_path).is_file():
             open_chat_preview(self, json_path)
+
+    def open_existing_preview(self):
+        initial_dir = Path(
+            self.out_var.get().strip() or str(app_dir() / "exports")
+        )
+        if not initial_dir.is_dir():
+            initial_dir = app_dir()
+
+        folder = filedialog.askdirectory(
+            parent=self,
+            title="选择已导出的聊天文件夹",
+            initialdir=str(initial_dir),
+        )
+        if not folder:
+            return
+
+        json_path = Path(folder) / "chat_full_parsed.json"
+        if not json_path.is_file():
+            messagebox.showwarning(
+                APP_TITLE,
+                "这个文件夹里没有找到 chat_full_parsed.json。\n\n"
+                "请选择一个具体的聊天导出文件夹。",
+            )
+            return
+
+        open_chat_preview(self, json_path)
 
     def open_output(self):
         if not self.last_output:
