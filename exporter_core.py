@@ -39,6 +39,50 @@ TYPE_LABEL = {
 }
 
 
+# 微信数据目录下常见的一层容器目录名；账号目录就在它们里面。
+WECHAT_DATA_SUBDIRS = ("xwechat_files", "WeChat Files", "xwechat_files_data")
+
+
+def resolve_db_dir(path) -> str:
+    """把用户给出的微信数据目录规整成 WeChatDB 需要的 db_dir。
+
+    WeChatDB 的 db_dir 指的是「账号目录的父目录」，即满足
+    ``<db_dir>/<账号>/db_storage`` 的那一层。但用户通常只知道自己在微信
+    「设置 → 文件管理」里看到的那个目录，例如 ``D:/WeChatData``，
+    真实布局却是 ``D:/WeChatData/xwechat_files/<账号>/db_storage``。
+
+    上游只在自动探测路径时做这层兼容，显式传 db_dir 时不做，这里补上，
+    让两种写法都能用。
+    """
+    base = Path(path).expanduser()
+    if not base.is_dir():
+        raise ValueError(f"微信数据目录不存在：{base}")
+
+    last_error = None
+    for cand in [base] + [base / name for name in WECHAT_DATA_SUBDIRS]:
+        if not cand.is_dir():
+            continue
+        try:
+            if any((child / "db_storage").is_dir() for child in cand.iterdir()):
+                return str(cand)
+        except OSError as exc:
+            # 记下来，等所有候选都试完再决定报哪个错：目录读不动和目录里
+            # 确实没有账号数据是两回事，混成一句会让排障走弯路。
+            last_error = exc
+            continue
+
+    if last_error is not None:
+        raise ValueError(
+            f"读取 {base} 时出错：{last_error}。"
+            "请确认对该目录有读取权限，且目录没有被占用或断开连接。"
+        ) from last_error
+
+    raise ValueError(
+        f"在 {base} 下没有找到微信账号数据（<账号>/db_storage）。"
+        "请指向微信「设置 → 文件管理」里显示的数据目录。"
+    )
+
+
 def safe_folder_name(name: str) -> str:
     name = (name or "未命名会话").strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).rstrip(" .")
@@ -1776,6 +1820,7 @@ def export_chat(
     export_voices=False,
     export_videos=False,
     transcribe_voices=False,
+    db_dir=None,
 ):
     def log(msg):
         if progress:
@@ -1784,8 +1829,13 @@ def export_chat(
     if transcribe_voices:
         export_voices = True
 
-    log("正在连接微信本地数据库…")
-    db = WeChatDB()
+    if db_dir:
+        db_dir = resolve_db_dir(db_dir)
+        log(f"正在连接微信本地数据库…（指定目录：{db_dir}）")
+    else:
+        log("正在连接微信本地数据库…")
+
+    db = WeChatDB(db_dir=db_dir)
     target = find_contact(db, keyword)
     username = target["username"]
     target_name = target.get("remark") or target.get("nick_name") or keyword
