@@ -24,7 +24,7 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 TYPE_LABEL = {
