@@ -35,6 +35,14 @@ if __name__ == "__main__":
         action="store_true",
         help="下载安装本地 SenseVoice 语音识别模型后退出",
     )
+    p.add_argument(
+        "--db-dir",
+        default=None,
+        help=(
+            "微信数据目录（微信「设置 → 文件管理」里显示的那个）。"
+            "默认自动探测；数据目录被自行迁移过、或自动探测读到错误副本时指定。"
+        ),
+    )
     a = p.parse_args()
 
     if a.install_asr:
@@ -52,5 +60,6 @@ if __name__ == "__main__":
         export_voices=(a.voices or a.media or a.transcribe_voices),
         export_videos=(a.videos or a.media),
         transcribe_voices=a.transcribe_voices,
+        db_dir=a.db_dir,
     )
     print(result)

@@ -45,8 +45,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("920x680")
-        self.minsize(820, 580)
+        self.geometry("920x730")
+        self.minsize(820, 630)
 
         try:
             icon_bytes = base64.b64decode(WINDOW_ICON_PNG_BASE64)
@@ -65,7 +65,7 @@ class App(tk.Tk):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
         pad.grid_columnconfigure(0, weight=1)
-        pad.grid_rowconfigure(8, weight=1)
+        pad.grid_rowconfigure(9, weight=1)
 
         ttk.Label(
             pad,
@@ -109,8 +109,26 @@ class App(tk.Tk):
         )
         ttk.Button(outrow, text="选择", command=self.choose_out).grid(row=0, column=2)
 
+        dbrow = ttk.Frame(pad)
+        dbrow.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        dbrow.grid_columnconfigure(1, weight=1)
+
+        ttk.Label(dbrow, text="微信数据目录：").grid(row=0, column=0, sticky="w")
+        self.db_dir_var = tk.StringVar()
+        ttk.Entry(dbrow, textvariable=self.db_dir_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 8)
+        )
+        ttk.Button(dbrow, text="选择", command=self.choose_db_dir).grid(
+            row=0, column=2
+        )
+        ttk.Label(
+            dbrow,
+            text="留空自动探测；数据目录迁移过、或导出结果停在旧时间点时在此指定。",
+            foreground="#6b7280",
+        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(2, 0))
+
         media_row = ttk.Frame(pad)
-        media_row.grid(row=5, column=0, sticky="ew", pady=(2, 2))
+        media_row.grid(row=6, column=0, sticky="ew", pady=(2, 2))
         ttk.Label(media_row, text="附带导出：").pack(side="left")
 
         self.images_var = tk.BooleanVar(value=True)
@@ -141,9 +159,9 @@ class App(tk.Tk):
         ttk.Label(
             pad,
             text="仅导出本机仍有缓存的附件；“语音转文字（本地）”默认关闭，勾选后会自动同时导出语音。",
-        ).grid(row=6, column=0, sticky="w", pady=(2, 4))
+        ).grid(row=7, column=0, sticky="w", pady=(2, 4))
 
-        ttk.Separator(pad).grid(row=7, column=0, sticky="ew", pady=10)
+        ttk.Separator(pad).grid(row=8, column=0, sticky="ew", pady=10)
 
         self.status = tk.Text(
             pad,
@@ -151,10 +169,10 @@ class App(tk.Tk):
             wrap="word",
             state="disabled",
         )
-        self.status.grid(row=8, column=0, sticky="nsew")
+        self.status.grid(row=9, column=0, sticky="nsew")
 
         bottom = ttk.Frame(pad)
-        bottom.grid(row=9, column=0, sticky="ew", pady=(10, 0))
+        bottom.grid(row=10, column=0, sticky="ew", pady=(10, 0))
         bottom.grid_columnconfigure(0, weight=1)
 
         self.preview_btn = ttk.Button(
@@ -179,6 +197,13 @@ class App(tk.Tk):
     def on_transcribe_toggle(self):
         if self.transcribe_var.get():
             self.voices_var.set(True)
+
+    def choose_db_dir(self):
+        path = filedialog.askdirectory(
+            initialdir=self.db_dir_var.get() or str(app_dir())
+        )
+        if path:
+            self.db_dir_var.set(path)
 
     def choose_out(self):
         path = filedialog.askdirectory(
@@ -259,6 +284,7 @@ class App(tk.Tk):
                 self.voices_var.get(),
                 self.videos_var.get(),
                 transcribe_voices,
+                self.db_dir_var.get().strip() or None,
             ),
             daemon=True,
         )
@@ -282,6 +308,7 @@ class App(tk.Tk):
         export_voices,
         export_videos,
         transcribe_voices,
+        db_dir,
     ):
         try:
             result = export_chat(
@@ -293,6 +320,7 @@ class App(tk.Tk):
                 export_voices=export_voices,
                 export_videos=export_videos,
                 transcribe_voices=transcribe_voices,
+                db_dir=db_dir,
             )
             self.q.put(("done", result))
         except Exception as e:
