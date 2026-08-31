@@ -20,6 +20,23 @@ def _norm_key(path: Path | str) -> str:
     return os.path.normcase(os.path.normpath(str(path)))
 
 
+
+
+def _safe_is_dir(path: Path) -> bool:
+    """Windows 某些受保护目录会让 is_dir/stat 抛 OSError，发现流程应直接跳过。"""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
+def _safe_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def _clean_path(value: str | Path) -> Path:
     raw = os.path.expandvars(os.path.expanduser(str(value).strip().strip('"\'')))
     # JSON / 配置文件中常见的双反斜杠路径。
@@ -29,13 +46,17 @@ def _clean_path(value: str | Path) -> Path:
 
 def _account_dirs(root: Path) -> list[Path]:
     try:
-        return [
-            child
-            for child in root.iterdir()
-            if child.is_dir() and (child / "db_storage").is_dir()
-        ]
+        children = list(root.iterdir())
     except OSError:
         return []
+
+    out: list[Path] = []
+    for child in children:
+        if not _safe_is_dir(child):
+            continue
+        if _safe_is_dir(child / "db_storage"):
+            out.append(child)
+    return out
 
 
 def _resolve_account_root(path: str | Path) -> Path | None:
@@ -44,14 +65,14 @@ def _resolve_account_root(path: str | Path) -> Path | None:
         base = _clean_path(path)
     except Exception:
         return None
-    if not base.is_dir():
+    if not _safe_is_dir(base):
         return None
 
     candidates = [base]
     candidates.extend(base / name for name in WECHAT_DATA_SUBDIRS)
 
     for cand in candidates:
-        if cand.is_dir() and _account_dirs(cand):
+        if _safe_is_dir(cand) and _account_dirs(cand):
             return cand
     return None
 
@@ -156,14 +177,14 @@ def _config_candidate_paths() -> list[str]:
 
     seen_files = set()
     for root in roots:
-        if not root.is_dir():
+        if not _safe_is_dir(root):
             continue
         try:
             files = list(root.glob("*")) + list(root.glob("*/*"))
         except OSError:
             continue
         for file in files[:300]:
-            if not file.is_file() or file.suffix.lower() not in _CONFIG_EXTS:
+            if not _safe_is_file(file) or file.suffix.lower() not in _CONFIG_EXTS:
                 continue
             key = _norm_key(file)
             if key in seen_files:
@@ -258,10 +279,15 @@ def _shallow_drive_candidates() -> list[Path]:
         for name in known_names:
             out.append(drive / name)
         try:
-            children = [p for p in drive.iterdir() if p.is_dir()]
+            raw_children = list(drive.iterdir())
         except OSError:
             continue
-        # 根目录通常只有几十个目录；限制数量避免异常磁盘拖慢 UI。
+        # 根目录通常只有几十个目录；逐个容错，WindowsApps/WpSystem 等
+        # 受保护目录可能在读取属性时直接抛 OSError。
+        children: list[Path] = []
+        for child in raw_children[:512]:
+            if _safe_is_dir(child):
+                children.append(child)
         for child in children[:256]:
             out.append(child)
     return out
@@ -312,7 +338,7 @@ def discover_wechat_data_dirs(current: str | None = None) -> list[dict]:
 
 
 def _browse_other(parent, initial: str | None) -> str | None:
-    start = initial if initial and Path(initial).is_dir() else str(Path.home())
+    start = initial if initial and _safe_is_dir(Path(initial)) else str(Path.home())
     path = filedialog.askdirectory(parent=parent, initialdir=start)
     return path or None
 
