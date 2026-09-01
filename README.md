@@ -263,6 +263,8 @@ SenseVoice 模型不会打进 EXE，只有用户主动开启本地语音转文�
 
 项目由仓库维护者提出需求、进行实际环境测试并负责发布与维护，也欢迎社区贡献。
 
+感谢 [fanyuantaier/wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica) 提供 Windows 微信 4.x 数据库读取与媒体处理等底层能力，本项目在其基础上完成聊天整理、媒体导出、预览和面向大模型的输出。
+
 感谢 [@wzh4464](https://github.com/wzh4464) 提交 PR #1，为项目加入手动指定微信数据目录的支持，并完善相关路径兼容和异常处理。
 
 ## License
