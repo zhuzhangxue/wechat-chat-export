@@ -4,7 +4,7 @@
 
 如果这个工具对你有帮助，欢迎点个 Star。
 
-目前源码版本：**v1.3.2**
+目前源码版本：**v1.3.3**
 
 支持私聊和群聊，可处理文字、长文本、引用回复、系统消息，并尽量导出本机仍有缓存的图片、文件、语音和视频。
 
@@ -62,7 +62,9 @@ exports/
 
 发送者身份按消息来源分片的 `Name2Id` 解析，再映射显示名；只有稳定账号 `username` 与本机账号一致才显示为“我”，不根据数字 ID 或昵称猜测。私聊映射到双方以外的账号、缺少映射等情况会显示“未知发送者”并在导出日志中汇总警告。群聊只剥离与已解析发送者 ID 一致的正文前缀，无法确认时保留原文。
 
-JSON 保留原有字段，并增加每条消息的 `source_db`、`real_sender_id`、`server_id`、`sender_username`、`is_self`（无法判断时为 `null`）、`sender_status`，以及顶层的 `sender_resolution_counts`，便于本地复查。无法确认本机账号时不判断“我”，解析状态会标记不确定。旧导出和旧 EXE 不会自动更新；请使用修复后的源码或重新打包的 EXE，选择新的输出目录重新导出，避免覆盖旧结果。
+JSON 保留原有字段，并增加每条消息的 `source_db`、`real_sender_id`、`server_id`、`sender_username`、`is_self`（无法判断时为 `null`）、`sender_status`，以及顶层的 `sender_resolution_counts`，便于本地复查。无法确认本机账号时不判断“我”，解析状态会标记不确定。
+
+v1.3.3 修复了旧版本在跨多个消息数据库分片导出时可能出现的发送者名称错误映射。如果你曾使用 v1.3.2 或更早版本导出大量历史记录，建议使用 v1.3.3 重新导出。旧导出不会自动更新，重新导出时建议选择新的输出目录，避免覆盖旧结果。
 
 ## 微信数据目录
 
@@ -270,6 +272,8 @@ SenseVoice 模型不会打进 EXE，只有用户主动开启本地语音转文�
 感谢 [fanyuantaier/wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica) 提供 Windows 微信 4.x 数据库读取与媒体处理等底层能力，本项目在其基础上完成聊天整理、媒体导出、预览和面向大模型的输出。
 
 感谢 [@wzh4464](https://github.com/wzh4464) 提交 PR #1，为项目加入手动指定微信数据目录的支持，并完善相关路径兼容和异常处理。
+
+感谢 [@EnTaroYan](https://github.com/EnTaroYan) 提交 Issue #2 和 PR #4，定位并修复跨消息数据库分片时的发送者身份映射错误，并补充相关回归测试。
 
 ## License
 

@@ -25,7 +25,7 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 RUST_SILK_URL = (
