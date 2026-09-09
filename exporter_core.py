@@ -367,6 +367,41 @@ def table_columns(conn, table: str) -> set[str]:
     }
 
 
+def _sender_id(value) -> int | None:
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        value = value.lstrip("0") or "0"
+        if len(value) > 19:
+            return None
+        value = int(value)
+    if type(value) is int and 0 < value <= 0x7FFFFFFFFFFFFFFF:
+        return value
+    return None
+
+
+def _sender_map(conn) -> tuple[dict, str]:
+    cols = {name.lower() for name in table_columns(conn, "Name2Id")}
+    if not cols:
+        return {}, "missing_name2id"
+    if "user_name" not in cols:
+        return {}, "unsupported_name2id"
+    # real_sender_id is a rowid in this shard, not in message_resource.db.
+    # Query errors must propagate rather than turning into guessed identities.
+    return dict(conn.execute("SELECT rowid, user_name FROM Name2Id")), "resolved"
+
+
+def _identity_username(value) -> str | None:
+    if isinstance(value, str) and value and not any(c.isspace() or c == "\x00" for c in value):
+        return value
+    return None
+
+
+def _json_message_id(value):
+    # Malformed SQLite BLOB IDs still need lossless, JSON-safe diagnostics.
+    if isinstance(value, bytes):
+        return {"encoding": "hex", "value": value.hex()}
+    return value
+
+
 def load_rows(db: WeChatDB, username: str):
     """跨全部 message_*.db 读取，保留来源库，避免只命中第一个分片。"""
     md5hex = hashlib.md5(username.encode("utf-8")).hexdigest()
@@ -390,6 +425,7 @@ def load_rows(db: WeChatDB, username: str):
                 "packed_info_data", "sort_seq",
             ]
             select_cols = [c for c in wanted if c in cols]
+            sender_index, map_status = _sender_map(conn)
             cur = conn.execute(
                 "SELECT " + ", ".join(select_cols) + f" FROM {table}"
             )
@@ -399,6 +435,20 @@ def load_rows(db: WeChatDB, username: str):
                 for c in wanted:
                     item.setdefault(c, None)
                 item["_db_rel"] = rel
+                sid = _sender_id(item["real_sender_id"])
+                sender_username = _identity_username(sender_index.get(sid))
+                if sid is None:
+                    sender_status = "invalid_sender_id"
+                elif map_status != "resolved":
+                    sender_status = map_status
+                elif sid not in sender_index:
+                    sender_status = "unmapped_sender_id"
+                elif sender_username is None:
+                    sender_status = "invalid_sender_username"
+                else:
+                    sender_status = "resolved"
+                item["_sender_username"] = sender_username
+                item["_sender_status"] = sender_status
                 rows.append(item)
         finally:
             conn.close()
@@ -423,43 +473,49 @@ def fmt_time(ts) -> str:
 
 
 def resolve_sender(
-    db: WeChatDB,
     row,
     is_group,
+    target_username,
     target_name,
-    sender_index,
     nicks,
-    self_nick,
+    self_username,
 ):
-    sid = row.get("real_sender_id")
-    if sid in (2, "2"):
-        return "我", False
+    username = row.get("_sender_username")
+    status = row.get("_sender_status", "unmapped_sender_id")
+    is_self = None
+    used_group_prefix = False
 
-    # 群聊：优先从消息正文前缀取真实成员 wxid。
-    if is_group:
-        raw_text = decode_blob(row.get("message_content"))
+    if low_type(row.get("local_type")) == 10000:
+        sender = "系统消息"
+        status = "system"
+    elif username is None:
+        sender = "未知发送者"
+    else:
+        is_self = username == self_username if self_username else None
+        if is_self:
+            sender = "我"
+        elif not is_group and username != target_username:
+            sender = "未知发送者（私聊身份异常）" if self_username else "未知发送者（本机账号未确认）"
+            status = "unexpected_private_sender" if self_username else "self_unknown"
+        else:
+            sender = (nicks.get(username) or username) if is_group else target_name
+        if self_username is None:
+            status = "self_unknown"
+        if sender == "我" and is_self is not True:
+            sender = f"我（{username}）"
+
+    if is_group and username and status != "system":
+        raw_text = decode_blob(row.get("message_content")) or decode_blob(row.get("compress_content"))
         prefix_wxid, _ = strip_group_prefix(raw_text)
-        if prefix_wxid:
-            return nicks.get(prefix_wxid, prefix_wxid), True
+        # A wxid-looking sentence is not evidence of authorship.
+        used_group_prefix = prefix_wxid == username and not username.endswith("@chatroom")
 
-    try:
-        resolved = db._resolve_sender(sid, sender_index, nicks, self_nick)
-    except Exception:
-        resolved = ""
-
-    if resolved == self_nick:
-        return "我", False
-
-    if is_group:
-        if resolved and resolved != str(sid):
-            return resolved, False
-        return (
-            f"成员#{sid}" if sid not in (None, "") else "未知成员"
-        ), False
-
-    if not resolved or resolved == str(sid):
-        return target_name, False
-    return resolved, False
+    return {
+        "sender": sender,
+        "sender_username": username,
+        "is_self": is_self,
+        "sender_status": status,
+    }, used_group_prefix
 
 
 
@@ -1926,24 +1982,32 @@ def export_chat(
     chat_dir = out_root / safe_folder_name(target_name)
     chat_dir.mkdir(parents=True, exist_ok=True)
     self_info = db.get_self_info()
-    self_nick = self_info.get("nick_name", "我")
-    sender_index = db._sender_id_index()
+    # get_self_info already uses the dependency's account-directory normalization.
+    # Compare its stable username exactly; never strip suffixes from message IDs.
+    self_username = _identity_username(self_info.get("username"))
     nicks = db._nickname_index()
     parsed = []
     type_counts = {}
+    sender_counts = Counter()
 
     for idx, row in enumerate(rows, 1):
         raw_type = row.get("local_type")
         t = low_type(raw_type)
         type_counts[str(t)] = type_counts.get(str(t), 0) + 1
-        sender, used_group_prefix = resolve_sender(db, row, is_group, target_name, sender_index, nicks, self_nick)
+        identity, used_group_prefix = resolve_sender(
+            row, is_group, username, target_name, nicks, self_username,
+        )
+        sender_counts[identity["sender_status"]] += 1
         content = parse_content(raw_type, row.get("message_content"), row.get("compress_content"), group_prefix_strip=(is_group and used_group_prefix))
         transcript = _voice_transcript(row) if t == 34 else ""
         parsed.append({
             "local_id": row.get("local_id"),
+            "server_id": _json_message_id(row.get("server_id")),
+            "source_db": row.get("_db_rel"),
+            "real_sender_id": _json_message_id(row.get("real_sender_id")),
             "type": TYPE_LABEL.get(t, str(t)),
             "type_code": raw_type,
-            "sender": sender,
+            **identity,
             "time": fmt_time(row.get("create_time")),
             "content": content,
             "sort_seq": row.get("sort_seq"),
@@ -1953,6 +2017,31 @@ def export_chat(
         })
         if progress and idx % 2000 == 0:
             log(f"已处理 {idx}/{len(rows)} 条消息…")
+
+    if self_username is None:
+        log("发送者身份警告：未能确认本机账号 username，无法判断“我”；未使用昵称或数字 ID 猜测。")
+    sender_warnings = {
+        status: count for status, count in sender_counts.items()
+        if status not in {"resolved", "system"}
+    }
+    if sender_warnings:
+        reasons = {
+            "missing_name2id": "来源分片缺少 Name2Id",
+            "unsupported_name2id": "来源分片 Name2Id 结构不支持",
+            "invalid_sender_id": "发送者 ID 无效",
+            "unmapped_sender_id": "来源分片没有对应发送者 ID",
+            "invalid_sender_username": "映射中的 username 无效",
+            "unexpected_private_sender": "私聊映射到双方以外的账号",
+            "self_unknown": "本机账号未确认",
+        }
+        summary = "；".join(
+            f"{count}× {reasons.get(status, status)}"
+            for status, count in sender_warnings.items()
+        )
+        log(
+            f"发送者身份警告：{sum(sender_warnings.values())}/{len(parsed)} 条消息需复查；"
+            f"{summary}。请查看 JSON 的 source_db、real_sender_id、sender_username、sender_status。"
+        )
 
     media_stats = {
         "images_requested": 0, "images_exported": 0,
@@ -2152,6 +2241,7 @@ def export_chat(
             "chat_name": target_name,
             "message_count": len(parsed),
             "type_counts": type_counts,
+            "sender_resolution_counts": dict(sender_counts),
             "media_stats": media_stats,
             "messages": parsed,
         }, f, ensure_ascii=False, indent=2)
@@ -2192,6 +2282,7 @@ def export_chat(
         "chat_name": target_name,
         "is_group": is_group,
         "message_count": len(parsed),
+        "sender_resolution_counts": dict(sender_counts),
         "media_stats": media_stats,
         "output_dir": str(chat_dir.resolve()),
         "txt": str(txt_path.resolve()),
