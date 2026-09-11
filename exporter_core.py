@@ -41,6 +41,7 @@ TYPE_LABEL = {
     3: "图片",
     34: "语音",
     43: "视频",
+    62: "视频",
     47: "动画表情",
     48: "位置",
     49: "文件/链接/卡片",
@@ -53,6 +54,8 @@ WECHAT_DATA_SUBDIRS = ("xwechat_files", "WeChat Files", "xwechat_files_data")
 
 SENSITIVE_TEMP_ROOT_NAME = "wechat-chat-export-sensitive"
 LEGACY_WECHATAUTO_CACHE_NAME = "wechatauto_db"
+SENSITIVE_OWNER_MARKER = ".owner.json"
+UNMARKED_STALE_SECONDS = 24 * 60 * 60
 
 
 def sensitive_cache_locations() -> dict[str, str]:
@@ -65,10 +68,118 @@ def sensitive_cache_locations() -> dict[str, str]:
 
 
 def _create_sensitive_workdir() -> Path:
-    # 为一次导出创建独立临时工作目录。
+    # 每次导出前先清理本项目自己上次异常退出留下的“已确认失效”目录。
+    clear_current_sensitive_cache()
+
     root = Path(sensitive_cache_locations()["current"])
     root.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix="run-", dir=root))
+    workdir = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+
+    # 记录创建该目录的进程，供下次启动判断“是否仍有实例正在使用”。
+    marker = workdir / SENSITIVE_OWNER_MARKER
+    try:
+        marker.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        # 标记失败不应阻止导出；这种目录以后按“无标记目录”保守处理。
+        pass
+
+    return workdir
+
+def _pid_is_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:
+        # psutil 异常时宁可把目录当作仍在使用，避免误删活动导出。
+        return True
+
+
+def clear_current_sensitive_cache():
+    # 自动清理本项目自己的“确定已失效”敏感工作目录。
+    # 带 owner 标记且 PID 已不存在：立即删除；PID 仍存在：跳过。
+    # 旧测试版的无标记目录：只在超过 24 小时后删除。
+    # 永远不自动删除旧版共享目录 %TEMP%\wechatauto_db。
+    root = Path(sensitive_cache_locations()["current"])
+    report = {"removed": [], "missing": [], "failed": [], "skipped": []}
+
+    if not root.exists():
+        report["missing"].append(str(root))
+        return report
+
+    try:
+        children = list(root.iterdir())
+    except OSError as exc:
+        report["failed"].append({
+            "path": str(root),
+            "error": f"{type(exc).__name__}: {exc}",
+        })
+        return report
+
+    now = datetime.now().timestamp()
+    for child in children:
+        if not child.is_dir() or not child.name.startswith("run-"):
+            report["skipped"].append(str(child))
+            continue
+
+        marker = child / SENSITIVE_OWNER_MARKER
+        owner_pid = None
+        marker_valid = False
+        if marker.is_file():
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8-sig"))
+                owner_pid = payload.get("pid")
+                marker_valid = owner_pid is not None
+            except (OSError, ValueError, json.JSONDecodeError):
+                marker_valid = False
+
+        if marker_valid:
+            if _pid_is_alive(owner_pid):
+                report["skipped"].append(str(child))
+                continue
+        else:
+            # 兼容此前已经产生的无 owner 标记目录：
+            # 最近 24 小时内一律保留，避免误删另一个旧实例正在使用的目录。
+            try:
+                age = max(0.0, now - child.stat().st_mtime)
+            except OSError:
+                report["skipped"].append(str(child))
+                continue
+            if age < UNMARKED_STALE_SECONDS:
+                report["skipped"].append(str(child))
+                continue
+
+        try:
+            shutil.rmtree(child)
+        except OSError as exc:
+            report["failed"].append({
+                "path": str(child),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        else:
+            report["removed"].append(str(child))
+
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+
+    return report
 
 
 def _cleanup_sensitive_workdir(workdir: Path, progress=None):
@@ -316,6 +427,21 @@ def parse_app_message(text: str) -> str:
         reply = title or desc or "[引用回复]"
         return f"{reply}\n    ↳ 引用 {ref_name or '对方'}：{ref_content}"
 
+    # 视频号分享通常是 local_type 49 + appmsg type 51。
+    # 不能让上面的“请升级微信”占位 URL 把它误判成普通链接。
+    if app_type == "51":
+        finder = _parse_finder_feed(text)
+        if finder:
+            author = finder.get("nickname") or finder.get("username") or ""
+            finder_desc = finder.get("desc") or ""
+            if author and finder_desc:
+                return f"[视频号] {author}：{finder_desc}"
+            if finder_desc:
+                return f"[视频号] {finder_desc}"
+            if author:
+                return f"[视频号] {author}"
+        return "[视频号分享]"
+
     if app_type == "6":
         return f"[文件] {title}".strip()
 
@@ -333,7 +459,6 @@ def parse_app_message(text: str) -> str:
     if desc:
         return f"[卡片] {desc}"
     return "[文件/链接/卡片]"
-
 
 def parse_system_message(text: str) -> str:
     text = clean_text(text)
@@ -410,7 +535,7 @@ def parse_content(
         return "[图片]"
     if t == 34:
         return "[语音]"
-    if t == 43:
+    if t in {43, 62}:
         return "[视频]"
     if t == 47:
         return "[动画表情]"
@@ -419,7 +544,6 @@ def parse_content(
     if t == 10000:
         return parse_system_message(text)
     return clean_text(text) if text else f"[消息 type={raw_type}]"
-
 
 def find_contact(db: WeChatDB, keyword: str):
     results = db.search_contact(keyword)
@@ -1872,62 +1996,300 @@ def _save_asr_cache(path: Path, cache: dict):
         pass
 
 
-def _extract_video_id(row: dict) -> str:
-    for value in (row.get("packed_info_data"), row.get("message_content")):
+def _finder_text(node, path: str) -> str:
+    if node is None:
+        return ""
+    return clean_text(node.findtext(path) or "")
+
+
+def _parse_finder_feed(text: str):
+    """解析 appmsg type 51 / finderFeed，保留后续定位媒体所需字段。
+
+    这里只做本地解析，不发起任何网络请求。
+    """
+    root = xml_root(text)
+    if root is None:
+        return None
+
+    appmsg = root if root.tag == "appmsg" else root.find("appmsg")
+    if appmsg is None:
+        appmsg = root.find(".//appmsg")
+    if appmsg is None:
+        return None
+
+    app_type = clean_text(appmsg.findtext("type") or "")
+    finder = appmsg.find("finderFeed")
+    if finder is None:
+        finder = appmsg.find(".//finderFeed")
+    if finder is None:
+        return None
+
+    media_items = []
+    for media in finder.findall("./mediaList/media"):
+        item = {
+            "media_type": _finder_text(media, "mediaType"),
+            "url": _finder_text(media, "url"),
+            "thumb_url": _finder_text(media, "thumbUrl"),
+            "cover_url": _finder_text(media, "coverUrl"),
+            "full_cover_url": _finder_text(media, "fullCoverUrl"),
+            "width": _finder_text(media, "width"),
+            "height": _finder_text(media, "height"),
+            "video_play_duration": _finder_text(media, "videoPlayDuration"),
+        }
+        item = {k: v for k, v in item.items() if v not in ("", None)}
+        if item:
+            media_items.append(item)
+
+    mega = finder.find("megaVideo")
+    result = {
+        "appmsg_type": app_type or None,
+        "object_id": _finder_text(finder, "objectId") or None,
+        "object_nonce_id": _finder_text(finder, "objectNonceId") or None,
+        "feed_type": _finder_text(finder, "feedType") or None,
+        "nickname": _finder_text(finder, "nickname") or None,
+        "username": _finder_text(finder, "username") or None,
+        "avatar": _finder_text(finder, "avatar") or None,
+        "desc": _finder_text(finder, "desc") or None,
+        "media_count": _finder_text(finder, "mediaCount") or None,
+        "media": media_items,
+        "mega_video": {
+            "object_id": _finder_text(mega, "objectId") or None,
+            "object_nonce_id": _finder_text(mega, "objectNonceId") or None,
+        } if mega is not None else None,
+    }
+    return result
+
+
+def _finder_feed_from_row(row: dict):
+    for value in (
+        row.get("message_content"),
+        row.get("compress_content"),
+        row.get("source"),
+    ):
+        text = decode_blob(value)
+        if not text or "finderFeed" not in text:
+            continue
+        parsed = _parse_finder_feed(text)
+        if parsed:
+            return parsed
+    return None
+
+
+def _add_video_id(out: list[str], value):
+    if value is None:
+        return
+    value = str(value).strip().lower()
+    if re.fullmatch(r"[0-9a-f]{32}", value) and value not in out:
+        out.append(value)
+
+
+def _collect_video_ids(row: dict, finder_feed=None) -> list[str]:
+    """收集可能对应本机视频文件名的标识，按可靠程度排序。"""
+    ids: list[str] = []
+
+    # 视频号 media URL 中常见 m=<32hex> / md5=<32hex>。
+    if finder_feed:
+        for media in finder_feed.get("media") or []:
+            for key in ("url", "thumb_url", "cover_url", "full_cover_url"):
+                value = media.get(key)
+                if not value:
+                    continue
+                for hit in re.finditer(
+                    r"(?i)(?:[?&](?:m|md5)=)([0-9a-f]{32})(?:[&#]|$)",
+                    str(value),
+                ):
+                    _add_video_id(ids, hit.group(1))
+
+                # 有些链接/路径直接以 hash 作为文件名。
+                path_part = str(value).split("?", 1)[0].replace("\\", "/")
+                stem = Path(path_part.rsplit("/", 1)[-1]).stem
+                if stem.lower().endswith("_raw"):
+                    stem = stem[:-4]
+                _add_video_id(ids, stem)
+
+    # 普通视频 / packed_info 的现有逻辑扩展为“收集全部”，不再只取第一个。
+    for value in (
+        row.get("packed_info_data"),
+        row.get("message_content"),
+        row.get("compress_content"),
+        row.get("source"),
+    ):
+        if value in (None, b"", ""):
+            continue
         if isinstance(value, (bytes, bytearray, memoryview)):
-            m = re.search(rb"([0-9a-fA-F]{32})", bytes(value))
-            if m:
-                return m.group(1).decode("ascii").lower()
-        elif isinstance(value, str):
-            m = re.search(r"([0-9a-fA-F]{32})", value)
-            if m:
-                return m.group(1).lower()
-    return ""
+            data = bytes(value)
+            for hit in re.finditer(
+                rb"(?<![0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F])",
+                data,
+            ):
+                _add_video_id(ids, hit.group(1).decode("ascii"))
+        else:
+            text = str(value)
+            for hit in re.finditer(
+                r"(?i)(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])",
+                text,
+            ):
+                _add_video_id(ids, hit.group(1))
+
+    return ids
 
 
-def _index_video_files(db: WeChatDB):
+def _extract_video_id(row: dict) -> str:
+    """向后兼容旧调用：返回第一个候选视频标识。"""
+    ids = _collect_video_ids(row)
+    return ids[0] if ids else ""
+
+def _index_video_files(db: WeChatDB, username: str | None = None):
+    """索引普通视频目录，并补充当前会话 attach/.../Video 目录。
+
+    同时把 `<hash>_raw.mp4` 以 `<hash>` 作为别名加入索引。
+    """
     account = Path(db.account_dir)
-    roots = [account / "msg" / "video", account / "video", account / "FileStorage" / "Video"]
-    index = {}
-    count = 0
+    roots = [
+        account / "msg" / "video",
+        account / "video",
+        account / "FileStorage" / "Video",
+    ]
+
+    if username:
+        chat_md5 = hashlib.md5(username.encode("utf-8")).hexdigest()
+        chat_attach = account / "msg" / "attach" / chat_md5
+        if chat_attach.exists():
+            roots.append(chat_attach)
+
+    allowed_exts = {
+        ".mp4", ".mov", ".mkv", ".avi",
+        ".flv", ".wmv", ".webm", ".m4v", ".3gp",
+    }
+    index: dict[str, list[Path]] = {}
+    seen = set()
+
     for root in roots:
         if not root.exists():
             continue
         try:
-            for p in root.rglob("*.mp4"):
-                if not p.is_file():
+            for p in root.rglob("*"):
+                if not p.is_file() or p.suffix.lower() not in allowed_exts:
                     continue
-                count += 1
-                index.setdefault(p.stem.casefold(), []).append(p)
+
+                try:
+                    unique = str(p.resolve())
+                except OSError:
+                    unique = str(p)
+                if unique in seen:
+                    continue
+                seen.add(unique)
+
+                stem = p.stem.casefold()
+                keys = {stem}
+                if stem.endswith("_raw"):
+                    keys.add(stem[:-4])
+
+                for hit in re.finditer(
+                    r"(?i)(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])",
+                    stem,
+                ):
+                    keys.add(hit.group(1).lower())
+
+                for key in keys:
+                    if key:
+                        index.setdefault(key, []).append(p)
         except OSError:
             continue
-    return {"by_stem": index, "count": count}
 
+    return {
+        "by_stem": index,
+        "count": len(seen),
+        "roots": [str(p) for p in roots if p.exists()],
+    }
 
-def _write_video_from_row(row, video_index, video_dir: Path):
-    vid = _extract_video_id(row)
-    candidates = video_index.get("by_stem", {}).get(vid.casefold(), []) if vid else []
+def _pick_video_candidate(candidates: list[Path], create_time) -> Path | None:
     if not candidates:
-        return None, (f"本机没有找到视频缓存：{vid}" if vid else "没有从消息中解析到视频标识")
+        return None
+
+    unique = []
+    seen = set()
+    for p in candidates:
+        key = str(p)
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    candidates = unique
+
+    ts = _normalize_timestamp(create_time)
+    if ts:
+        month = datetime.fromtimestamp(ts).strftime("%Y-%m")
+        month_hits = [p for p in candidates if month in p.parts]
+        if month_hits:
+            candidates = month_hits
+
+    def score(path: Path):
+        # 普通播放版优先于 _raw；同类时再取更大、更新的文件。
+        regular = 0 if path.stem.casefold().endswith("_raw") else 1
+        try:
+            stat = path.stat()
+            return regular, stat.st_size, stat.st_mtime
+        except OSError:
+            return regular, 0, 0
+
     try:
-        src = max(candidates, key=lambda p: (p.stat().st_size, p.stat().st_mtime))
-    except OSError:
-        src = candidates[0]
+        return max(candidates, key=score)
+    except Exception:
+        return candidates[0]
+
+
+def _write_video_from_row(
+    row,
+    video_index,
+    video_dir: Path,
+    finder_feed=None,
+):
+    ids = _collect_video_ids(row, finder_feed=finder_feed)
+    src = None
+    matched_id = None
+
+    for vid in ids:
+        candidates = video_index.get("by_stem", {}).get(vid.casefold(), [])
+        src = _pick_video_candidate(candidates, row.get("create_time"))
+        if src is not None:
+            matched_id = vid
+            break
+
+    if src is None:
+        if finder_feed:
+            if ids:
+                return None, (
+                    "视频号信息已解析，但本机未找到可可靠匹配的视频缓存"
+                    f"（候选标识：{' / '.join(ids[:3])}）"
+                )
+            return None, (
+                "视频号信息已解析，但没有找到可用于本机缓存匹配的视频标识"
+            )
+
+        if ids:
+            return None, f"本机没有找到视频缓存：{' / '.join(ids[:3])}"
+        return None, "没有从消息中解析到视频标识"
+
     video_dir.mkdir(parents=True, exist_ok=True)
     seq = row.get("sort_seq") or row.get("local_id") or "video"
     lid = row.get("local_id") or "0"
-    out = video_dir / f"{seq}_{lid}.mp4"
+    ext = src.suffix.lower() if src.suffix else ".mp4"
+    out = video_dir / f"{seq}_{lid}{ext}"
+
     try:
         shutil.copy2(src, out)
     except OSError as exc:
         return None, f"复制视频失败：{exc}"
+
     return {
         "kind": "video",
         "path": str(out),
-        "format": "mp4",
+        "format": ext.lstrip("."),
+        "source": "finder_feed" if finder_feed else "video_message",
+        "matched_id": matched_id,
+        "source_variant": "raw" if src.stem.casefold().endswith("_raw") else "play",
         "previewable": False,
     }, None
-
 
 def _relativize_media(chat_dir: Path, media: dict):
     for key in ("path", "silk_path"):
@@ -2073,12 +2435,13 @@ def _export_chat_impl(
         sender_counts[identity["sender_status"]] += 1
         content = parse_content(raw_type, row.get("message_content"), row.get("compress_content"), group_prefix_strip=(is_group and used_group_prefix))
         transcript = _voice_transcript(row) if t == 34 else ""
+        finder_feed = _finder_feed_from_row(row) if t == 49 else None
         parsed.append({
             "local_id": row.get("local_id"),
             "server_id": _json_message_id(row.get("server_id")),
             "source_db": row.get("_db_rel"),
             "real_sender_id": _json_message_id(row.get("real_sender_id")),
-            "type": TYPE_LABEL.get(t, str(t)),
+            "type": "视频号" if finder_feed else TYPE_LABEL.get(t, str(t)),
             "type_code": raw_type,
             **identity,
             "time": fmt_time(row.get("create_time")),
@@ -2087,6 +2450,7 @@ def _export_chat_impl(
             "transcript": transcript or None,
             "transcript_source": "wechat" if transcript else None,
             "media": None,
+            "finder_feed": finder_feed,
         })
         if progress and idx % 2000 == 0:
             log(f"已处理 {idx}/{len(rows)} 条消息…")
@@ -2135,7 +2499,11 @@ def _export_chat_impl(
             low_type(r.get("local_type")) == 49 and parse_content(r.get("local_type"), r.get("message_content"), r.get("compress_content")).startswith("[文件]")
             for r in rows
         )
-        video_rows_exist = export_videos and any(low_type(r.get("local_type")) == 43 for r in rows)
+        video_rows_exist = export_videos and any(
+            low_type(r.get("local_type")) in {43, 62}
+            or _finder_feed_from_row(r) is not None
+            for r in rows
+        )
         image_index, image_keys, file_index, video_index = {}, None, {}, {}
         image_failures, file_failures, voice_failures, video_failures = Counter(), Counter(), Counter(), Counter()
 
@@ -2163,7 +2531,7 @@ def _export_chat_impl(
 
         if video_rows_exist:
             log("正在索引本机视频缓存…")
-            video_index = _index_video_files(db)
+            video_index = _index_video_files(db, username)
             log(f"已索引本机视频缓存：{video_index.get('count', 0)} 个 MP4。")
 
         if export_voices and _find_rust_silk() is None:
@@ -2280,15 +2648,33 @@ def _export_chat_impl(
                         "transcript": transcript,
                     }
 
-            elif export_videos and t == 43:
+            elif export_videos and (
+                t in {43, 62} or msg.get("finder_feed")
+            ):
                 media_stats["videos_requested"] += 1
-                media, reason = _write_video_from_row(row, video_index, video_dir)
+                media, reason = _write_video_from_row(
+                    row,
+                    video_index,
+                    video_dir,
+                    finder_feed=msg.get("finder_feed"),
+                )
                 if media:
                     msg["media"] = _relativize_media(chat_dir, media)
                     media_stats["videos_exported"] += 1
                 else:
-                    reason = reason or "未知原因"; video_failures[reason] += 1
-                    msg["media"] = {"kind": "video", "available": False, "path": None, "reason": reason}
+                    reason = reason or "未知原因"
+                    video_failures[reason] += 1
+                    msg["media"] = {
+                        "kind": "video",
+                        "available": False,
+                        "path": None,
+                        "reason": reason,
+                        "source": (
+                            "finder_feed"
+                            if msg.get("finder_feed")
+                            else "video_message"
+                        ),
+                    }
 
             if progress and idx % 200 == 0:
                 log(
@@ -2373,6 +2759,13 @@ def export_chat(
     transcribe_voices=False,
     db_dir=None,
 ):
+    # 导出前顺便清理本项目上次异常退出留下、且已确认失效的工作目录。
+    stale_report = clear_current_sensitive_cache()
+    if progress and stale_report.get("removed"):
+        progress(
+            f"已自动清理 {len(stale_report['removed'])} 个上次异常退出留下的敏感临时目录。"
+        )
+
     # 在一次性临时 workdir 中完成导出，并在结束后清理敏感缓存。
     workdir = _create_sensitive_workdir()
     if progress:

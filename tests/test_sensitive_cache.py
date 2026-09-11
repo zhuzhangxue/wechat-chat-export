@@ -50,6 +50,9 @@ class SensitiveCacheTests(unittest.TestCase):
                 workdir = Path(kwargs["workdir"])
                 seen["workdir"] = workdir
                 self.assertTrue(workdir.is_dir())
+                self.assertTrue(
+                    (workdir / self.core.SENSITIVE_OWNER_MARKER).is_file()
+                )
                 (workdir / "keys.json").write_text('{"secret":"value"}', encoding="utf-8")
                 (workdir / "decrypted.db").write_bytes(b"SQLite format 3")
                 return {"chat_name": keyword}
@@ -84,6 +87,72 @@ class SensitiveCacheTests(unittest.TestCase):
                     self.core.export_chat("Synthetic")
 
             self.assertFalse(seen["workdir"].exists())
+
+
+    def test_startup_cleanup_removes_dead_run_but_preserves_active_and_legacy(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            with patch.object(
+                self.core.tempfile,
+                "gettempdir",
+                return_value=str(temp_root),
+            ):
+                locations = self.core.sensitive_cache_locations()
+                current = Path(locations["current"])
+                legacy = Path(locations["legacy"])
+                dead = current / "run-dead"
+                active = current / "run-active"
+                dead.mkdir(parents=True)
+                active.mkdir(parents=True)
+                legacy.mkdir(parents=True)
+
+                (dead / self.core.SENSITIVE_OWNER_MARKER).write_text(
+                    '{"pid": 111}',
+                    encoding="utf-8",
+                )
+                (active / self.core.SENSITIVE_OWNER_MARKER).write_text(
+                    '{"pid": 222}',
+                    encoding="utf-8",
+                )
+                (dead / "keys.json").write_text("dead secret", encoding="utf-8")
+                (active / "keys.json").write_text("active secret", encoding="utf-8")
+                (legacy / "keys.json").write_text("legacy secret", encoding="utf-8")
+
+                with patch.object(
+                    self.core,
+                    "_pid_is_alive",
+                    side_effect=lambda pid: int(pid) == 222,
+                ):
+                    report = self.core.clear_current_sensitive_cache()
+
+            self.assertFalse(dead.exists())
+            self.assertTrue(active.exists())
+            self.assertTrue(legacy.exists())
+            self.assertIn(str(dead), report["removed"])
+            self.assertIn(str(active), report["skipped"])
+            self.assertEqual(report["failed"], [])
+
+    def test_startup_cleanup_preserves_recent_unmarked_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            with patch.object(
+                self.core.tempfile,
+                "gettempdir",
+                return_value=str(temp_root),
+            ):
+                current = Path(
+                    self.core.sensitive_cache_locations()["current"]
+                )
+                recent = current / "run-old-format"
+                recent.mkdir(parents=True)
+                (recent / "keys.json").write_text("secret", encoding="utf-8")
+
+                report = self.core.clear_current_sensitive_cache()
+
+            self.assertTrue(recent.exists())
+            self.assertIn(str(recent), report["skipped"])
+            self.assertEqual(report["removed"], [])
+            self.assertEqual(report["failed"], [])
 
     def test_manual_cleanup_only_removes_known_sensitive_roots(self):
         with tempfile.TemporaryDirectory() as td:
