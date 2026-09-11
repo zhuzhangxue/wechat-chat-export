@@ -171,7 +171,8 @@ class VideoChannelTests(unittest.TestCase):
         )
         self.assertIsNone(media)
         self.assertIn("视频号信息已解析", reason)
-        self.assertIn("未找到可可靠匹配的视频缓存", reason)
+        self.assertIn("本地只读导出无法获得与视频 URL 配对的解密信息", reason)
+        self.assertIn("不会自动联网下载或猜测缓存文件", reason)
 
 
 if __name__ == "__main__":
