@@ -13,6 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 import psutil
 
 from exporter_core import (
+    clear_sensitive_cache,
     export_chat,
     install_local_asr_model,
     install_rust_silk,
@@ -182,22 +183,30 @@ class App(tk.Tk):
         bottom.grid(row=10, column=0, sticky="ew", pady=(10, 0))
         bottom.grid_columnconfigure(0, weight=1)
 
+        self.clear_cache_btn = ttk.Button(
+            bottom,
+            text="清除敏感缓存",
+            command=self.clear_sensitive_cache_ui,
+        )
+        self.clear_cache_btn.grid(
+            row=0, column=1, sticky="e", padx=(0, 8)
+        )
+
         self.existing_preview_btn = ttk.Button(
             bottom,
             text="预览已有聊天",
             command=self.open_existing_preview,
         )
         self.existing_preview_btn.grid(
-            row=0, column=1, sticky="e", padx=(0, 8)
+            row=0, column=2, sticky="e", padx=(0, 8)
         )
-
         self.preview_btn = ttk.Button(
             bottom,
             text="打开聊天预览",
             command=self.open_preview,
             state="disabled",
         )
-        self.preview_btn.grid(row=0, column=2, sticky="e", padx=(0, 8))
+        self.preview_btn.grid(row=0, column=3, sticky="e", padx=(0, 8))
 
         self.open_btn = ttk.Button(
             bottom,
@@ -205,7 +214,7 @@ class App(tk.Tk):
             command=self.open_output,
             state="disabled",
         )
-        self.open_btn.grid(row=0, column=3, sticky="e")
+        self.open_btn.grid(row=0, column=4, sticky="e")
 
         self.entry.focus_set()
         self.after(100, self.poll_queue)
@@ -213,6 +222,39 @@ class App(tk.Tk):
     def on_transcribe_toggle(self):
         if self.transcribe_var.get():
             self.voices_var.set(True)
+
+    def clear_sensitive_cache_ui(self):
+        confirmed = messagebox.askyesno(
+            APP_TITLE,
+            "将清除本工具可能留下的敏感临时缓存，包括：\n\n"
+            "1. v1.3.4 当前版本的一次性临时工作目录；\n"
+            "2. v1.3.3 及更早版本 / wechatauto-replica 默认保存在 "
+            "%TEMP%\\wechatauto_db 下的数据库密钥、图片密钥和解密数据库缓存。\n\n"
+            "这不会删除微信原始聊天数据库，也不会删除已经导出的聊天结果。\n\n"
+            "如果还有其他程序正在使用 wechatauto-replica，请先关闭它们。\n\n"
+            "确定继续吗？",
+        )
+        if not confirmed:
+            return
+
+        self.export_btn.configure(state="disabled")
+        self.clear_cache_btn.configure(state="disabled")
+        self.log("")
+        self.log("正在清除敏感临时缓存…")
+        threading.Thread(
+            target=self.clear_sensitive_cache_worker,
+            daemon=True,
+        ).start()
+
+    def clear_sensitive_cache_worker(self):
+        try:
+            report = clear_sensitive_cache()
+            self.q.put(("cache_cleared", report))
+        except Exception as exc:
+            self.q.put((
+                "cache_clear_error",
+                f"{type(exc).__name__}: {exc}",
+            ))
 
     def choose_db_dir(self):
         self.log("正在查找本机微信数据目录……")
@@ -324,6 +366,7 @@ class App(tk.Tk):
                 return
 
         self.export_btn.configure(state="disabled")
+        self.clear_cache_btn.configure(state="disabled")
         self.open_btn.configure(state="disabled")
         self.preview_btn.configure(state="disabled")
         self.last_output = None
@@ -403,6 +446,7 @@ class App(tk.Tk):
                     self.last_result = payload
                     self.log(f"输出：{payload['output_dir']}")
                     self.export_btn.configure(state="normal")
+                    self.clear_cache_btn.configure(state="normal")
                     self.open_btn.configure(state="normal")
                     self.preview_btn.configure(state="normal")
 
@@ -423,14 +467,68 @@ class App(tk.Tk):
                         f"{stats.get('videos_requested', 0)}"
                     )
 
-                    messagebox.showinfo(
+                    cleanup_ok = payload.get("sensitive_cache_cleanup", True)
+                    cleanup_error = payload.get("sensitive_cache_cleanup_error")
+                    cleanup_note = (
+                        ""
+                        if cleanup_ok
+                        else (
+                            "\n\n⚠ 敏感临时缓存自动清理失败。"
+                            "\n请点击“清除敏感缓存”重试。"
+                            + (f"\n详细信息：{cleanup_error}" if cleanup_error else "")
+                        )
+                    )
+                    show_result = (
+                        messagebox.showinfo
+                        if cleanup_ok
+                        else messagebox.showwarning
+                    )
+                    show_result(
                         APP_TITLE,
                         f"导出完成。\n\n"
                         f"类型：{'群聊' if payload['is_group'] else '私聊'}\n"
                         f"消息数：{payload['message_count']}\n"
                         f"会话：{payload['chat_name']}"
                         f"{media_line}\n\n"
-                        "已生成 TXT、Markdown 和 JSON。",
+                        "已生成 TXT、Markdown 和 JSON。"
+                        f"{cleanup_note}",
+                    )
+                elif kind == "cache_cleared":
+                    self.export_btn.configure(state="normal")
+                    self.clear_cache_btn.configure(state="normal")
+                    removed = payload.get("removed") or []
+                    failed = payload.get("failed") or []
+                    if removed:
+                        for path in removed:
+                            self.log(f"已清除：{path}")
+                    else:
+                        self.log("没有发现需要清理的敏感缓存。")
+                    if failed:
+                        details = "\n".join(
+                            f"{item.get('path')}：{item.get('error')}"
+                            for item in failed
+                        )
+                        self.log("部分敏感缓存清理失败。")
+                        messagebox.showwarning(
+                            APP_TITLE,
+                            "部分敏感缓存清理失败。\n\n"
+                            "请确认没有其他程序正在使用这些文件，然后重试。\n\n"
+                            + details,
+                        )
+                    else:
+                        messagebox.showinfo(
+                            APP_TITLE,
+                            "敏感缓存清理完成。"
+                            if removed
+                            else "没有发现需要清理的敏感缓存。",
+                        )
+                elif kind == "cache_clear_error":
+                    self.export_btn.configure(state="normal")
+                    self.clear_cache_btn.configure(state="normal")
+                    self.log("敏感缓存清理失败：" + payload)
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "敏感缓存清理失败：\n\n" + payload,
                     )
                 elif kind == "asr_installed":
                     self.export_btn.configure(state="normal")
@@ -460,6 +558,7 @@ class App(tk.Tk):
                     )
                 elif kind == "error":
                     self.export_btn.configure(state="normal")
+                    self.clear_cache_btn.configure(state="normal")
                     self.log("导出失败：" + payload)
                     messagebox.showerror(
                         APP_TITLE,

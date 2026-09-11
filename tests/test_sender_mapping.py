@@ -139,7 +139,10 @@ class SenderMappingTests(unittest.TestCase):
             result = self.core.export_chat(
                 "Target remark", out_root=self.root / "output", progress=logs.append,
             )
-        constructor.assert_called_once_with(db_dir=None)
+        constructor.assert_called_once()
+        call_kwargs = constructor.call_args.kwargs
+        self.assertIsNone(call_kwargs["db_dir"])
+        self.assertFalse(Path(call_kwargs["workdir"]).exists())
         data = json.loads(Path(result["json"]).read_text(encoding="utf-8-sig"))
         self.assertEqual(data["message_count"], len(data["messages"]))
         self.assertEqual(data["sender_resolution_counts"], result["sender_resolution_counts"])

@@ -25,7 +25,7 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 RUST_SILK_URL = (
@@ -50,6 +50,78 @@ TYPE_LABEL = {
 
 # 微信数据目录下常见的一层容器目录名；账号目录就在它们里面。
 WECHAT_DATA_SUBDIRS = ("xwechat_files", "WeChat Files", "xwechat_files_data")
+
+SENSITIVE_TEMP_ROOT_NAME = "wechat-chat-export-sensitive"
+LEGACY_WECHATAUTO_CACHE_NAME = "wechatauto_db"
+
+
+def sensitive_cache_locations() -> dict[str, str]:
+    # 返回本项目可能涉及的敏感临时缓存目录。
+    temp_root = Path(tempfile.gettempdir())
+    return {
+        "current": str(temp_root / SENSITIVE_TEMP_ROOT_NAME),
+        "legacy": str(temp_root / LEGACY_WECHATAUTO_CACHE_NAME),
+    }
+
+
+def _create_sensitive_workdir() -> Path:
+    # 为一次导出创建独立临时工作目录。
+    root = Path(sensitive_cache_locations()["current"])
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="run-", dir=root))
+
+
+def _cleanup_sensitive_workdir(workdir: Path, progress=None):
+    # 尽力删除一次性工作目录，不用清理错误覆盖原始导出结果。
+    workdir = Path(workdir)
+    try:
+        shutil.rmtree(workdir)
+    except FileNotFoundError:
+        ok, error = True, None
+    except OSError as exc:
+        ok, error = False, f"{type(exc).__name__}: {exc}"
+    else:
+        ok, error = True, None
+
+    if ok:
+        if progress:
+            progress("敏感临时缓存已清理。")
+        try:
+            workdir.parent.rmdir()
+        except OSError:
+            pass
+    elif progress:
+        progress(
+            "敏感临时缓存清理失败："
+            f"{workdir}（{error}）。"
+            "请在没有导出任务运行时使用“清除敏感缓存”重试。"
+        )
+    return ok, error
+
+
+def clear_sensitive_cache():
+    # 显式清理当前版本临时目录和旧版 wechatauto 默认缓存。
+    # 旧版目录也可能被其他直接使用 wechatauto-replica 的程序共用，
+    # 因此只在用户主动触发本函数时删除。
+    locations = sensitive_cache_locations()
+    report = {"removed": [], "missing": [], "failed": []}
+
+    for key in ("current", "legacy"):
+        path = Path(locations[key])
+        if not path.exists():
+            report["missing"].append(str(path))
+            continue
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            report["failed"].append({
+                "path": str(path),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+        else:
+            report["removed"].append(str(path))
+
+    return report
 
 
 def resolve_db_dir(path) -> str:
@@ -1603,7 +1675,7 @@ def install_local_asr_model(progress=None):
 
         request = urllib.request.Request(
             SENSEVOICE_MODEL_URL,
-            headers={"User-Agent": "WeChat-Chat-Export-for-LLM/1.3.0"},
+            headers={"User-Agent": f"WeChat-Chat-Export-for-LLM/{APP_VERSION}"},
         )
         with urllib.request.urlopen(request, timeout=60) as response, archive.open("wb") as f:
             total = int(response.headers.get("Content-Length") or 0)
@@ -1943,7 +2015,7 @@ def _write_markdown(parsed: list[dict], path: Path, is_group: bool, target_name:
                 f.write(f"> {label}：{_md_message_content(transcript)}\n\n")
 
 
-def export_chat(
+def _export_chat_impl(
     keyword: str,
     out_root="exports",
     progress=None,
@@ -1953,6 +2025,7 @@ def export_chat(
     export_videos=False,
     transcribe_voices=False,
     db_dir=None,
+    workdir=None,
 ):
     def log(msg):
         if progress:
@@ -1967,7 +2040,7 @@ def export_chat(
     else:
         log("正在连接微信本地数据库…")
 
-    db = WeChatDB(db_dir=db_dir)
+    db = WeChatDB(db_dir=db_dir, workdir=workdir)
     target = find_contact(db, keyword)
     username = target["username"]
     target_name = target.get("remark") or target.get("nick_name") or keyword
@@ -2289,3 +2362,44 @@ def export_chat(
         "md": str(md_path.resolve()),
         "json": str(json_path.resolve()),
     }
+def export_chat(
+    keyword: str,
+    out_root="exports",
+    progress=None,
+    export_images=False,
+    export_files=False,
+    export_voices=False,
+    export_videos=False,
+    transcribe_voices=False,
+    db_dir=None,
+):
+    # 在一次性临时 workdir 中完成导出，并在结束后清理敏感缓存。
+    workdir = _create_sensitive_workdir()
+    if progress:
+        progress("敏感数据库密钥和解密缓存将使用一次性临时目录，导出结束后自动清理。")
+
+    result = None
+    try:
+        result = _export_chat_impl(
+            keyword,
+            out_root=out_root,
+            progress=progress,
+            export_images=export_images,
+            export_files=export_files,
+            export_voices=export_voices,
+            export_videos=export_videos,
+            transcribe_voices=transcribe_voices,
+            db_dir=db_dir,
+            workdir=str(workdir),
+        )
+    except Exception:
+        _cleanup_sensitive_workdir(workdir, progress=progress)
+        raise
+
+    cleanup_ok, cleanup_error = _cleanup_sensitive_workdir(
+        workdir,
+        progress=progress,
+    )
+    result["sensitive_cache_cleanup"] = cleanup_ok
+    result["sensitive_cache_cleanup_error"] = cleanup_error
+    return result

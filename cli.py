@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import argparse
 
-from exporter_core import export_chat, install_local_asr_model, install_rust_silk
+from exporter_core import clear_sensitive_cache, export_chat, install_local_asr_model, install_rust_silk
 
 
 if __name__ == "__main__":
@@ -41,6 +41,14 @@ if __name__ == "__main__":
         help="下载安装 rust-silk 语音解码器后退出",
     )
     p.add_argument(
+        "--clear-sensitive-cache",
+        action="store_true",
+        help=(
+            "清除当前版本临时敏感缓存，以及 v1.3.3 及更早版本 / "
+            "wechatauto-replica 默认留下的密钥和解密数据库缓存后退出"
+        ),
+    )
+    p.add_argument(
         "--db-dir",
         default=None,
         help=(
@@ -56,10 +64,28 @@ if __name__ == "__main__":
     if a.install_rust_silk:
         install_rust_silk(progress=print)
         raise SystemExit(0)
+    if a.clear_sensitive_cache:
+        report = clear_sensitive_cache()
+        for path in report.get("removed") or []:
+            print("已清除：" + path)
+        if not report.get("removed"):
+            print("没有发现需要清理的敏感缓存。")
+        failed = report.get("failed") or []
+        if failed:
+            for item in failed:
+                print(
+                    "清理失败："
+                    + str(item.get("path"))
+                    + "："
+                    + str(item.get("error"))
+                )
+            raise SystemExit(1)
+        raise SystemExit(0)
     if not a.name:
         p.error(
             "请提供好友备注/昵称或群名；"
-            "或使用 --install-asr / --install-rust-silk"
+            "或使用 --install-asr / --install-rust-silk / "
+            "--clear-sensitive-cache"
         )
 
     result = export_chat(
