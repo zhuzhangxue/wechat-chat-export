@@ -53,27 +53,6 @@ def is_wechat_running() -> bool:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        # 启动时自动清理本项目自己上次异常退出留下的敏感缓存。
-        # 不自动触碰旧版共享的 %TEMP%\wechatauto_db。
-        startup_cache_report = clear_current_sensitive_cache()
-        removed = startup_cache_report.get("removed") or []
-        failed = startup_cache_report.get("failed") or []
-        if removed:
-            removed_count = len(removed)
-            self.after(
-                0,
-                lambda removed_count=removed_count: self.log(
-                    f"已自动清理上次异常退出留下的敏感临时缓存：{removed_count} 个目录。"
-                ),
-            )
-        if failed:
-            self.after(
-                0,
-                lambda: self.log(
-                    "检测到敏感临时缓存残留，但自动清理失败；"
-                    "可在确认没有导出任务运行后使用“清除敏感缓存”重试。"
-                ),
-            )
         self.title(APP_TITLE)
         self.geometry("920x730")
         self.minsize(820, 630)

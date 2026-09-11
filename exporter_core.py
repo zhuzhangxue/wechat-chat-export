@@ -68,9 +68,7 @@ def sensitive_cache_locations() -> dict[str, str]:
 
 
 def _create_sensitive_workdir() -> Path:
-    # 每次导出前先清理本项目自己上次异常退出留下的“已确认失效”目录。
-    clear_current_sensitive_cache()
-
+    # 只负责创建本次独立工作目录；失效残留由 export_chat() 在导出前统一清理。
     root = Path(sensitive_cache_locations()["current"])
     root.mkdir(parents=True, exist_ok=True)
     workdir = Path(tempfile.mkdtemp(prefix="run-", dir=root))
@@ -2789,7 +2787,8 @@ def export_chat(
             db_dir=db_dir,
             workdir=str(workdir),
         )
-    except Exception:
+    except BaseException:
+        # KeyboardInterrupt / SystemExit 也先尽力删除本次敏感工作目录，再原样抛出。
         _cleanup_sensitive_workdir(workdir, progress=progress)
         raise
 

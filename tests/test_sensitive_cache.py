@@ -89,6 +89,53 @@ class SensitiveCacheTests(unittest.TestCase):
             self.assertFalse(seen["workdir"].exists())
 
 
+    def test_export_removes_workdir_on_keyboard_interrupt(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            seen = {}
+
+            def fake_impl(keyword, **kwargs):
+                workdir = Path(kwargs["workdir"])
+                seen["workdir"] = workdir
+                (workdir / "keys.json").write_text("secret", encoding="utf-8")
+                raise KeyboardInterrupt()
+
+            with (
+                patch.object(self.core.tempfile, "gettempdir", return_value=str(temp_root)),
+                patch.object(self.core, "_export_chat_impl", side_effect=fake_impl),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.core.export_chat("Synthetic")
+
+            self.assertFalse(seen["workdir"].exists())
+
+    def test_export_runs_stale_cleanup_once(self):
+        with tempfile.TemporaryDirectory() as td:
+            temp_root = Path(td)
+            cleanup_report = {
+                "removed": [],
+                "missing": [],
+                "failed": [],
+                "skipped": [],
+            }
+
+            def fake_impl(keyword, **kwargs):
+                return {"chat_name": keyword}
+
+            with (
+                patch.object(self.core.tempfile, "gettempdir", return_value=str(temp_root)),
+                patch.object(
+                    self.core,
+                    "clear_current_sensitive_cache",
+                    return_value=cleanup_report,
+                ) as cleanup,
+                patch.object(self.core, "_export_chat_impl", side_effect=fake_impl),
+            ):
+                result = self.core.export_chat("Synthetic")
+
+            self.assertEqual(cleanup.call_count, 1)
+            self.assertTrue(result["sensitive_cache_cleanup"])
+
     def test_startup_cleanup_removes_dead_run_but_preserves_active_and_legacy(self):
         with tempfile.TemporaryDirectory() as td:
             temp_root = Path(td)
