@@ -45,6 +45,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       - name: Install dependencies
         shell: pwsh
@@ -52,6 +53,28 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller
           python -m pip install -r requirements.txt
+
+      - name: Verify pinned wechatauto API
+        shell: pwsh
+        run: |
+          @'
+          import inspect
+          import wechatauto
+          from wechatauto import MediaDownloader, WeChatDB
+
+          assert wechatauto.__version__ == "1.2.4.4", wechatauto.__version__
+          for name in ("_open", "_nickname_index", "extract_master_key"):
+              assert hasattr(WeChatDB, name), name
+          for name in (
+              "_collect_templates", "_get_xor_key", "_derive_cfg_key",
+              "_scan_aes_key", "decrypt_image",
+          ):
+              assert hasattr(MediaDownloader, name), name
+          assert "WECHATAUTO_KEYS_DIR" in inspect.getsource(WeChatDB._stable_key_dirs)
+          for name in ("_try_other_accounts", "_select_account_by_keys"):
+              assert "tempfile.gettempdir()" in inspect.getsource(getattr(WeChatDB, name))
+          print("wechatauto-replica contract OK:", wechatauto.__version__)
+          '@ | python -
 
       - name: Download pinned rust-silk
         shell: pwsh

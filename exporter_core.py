@@ -12,10 +12,12 @@ import tempfile
 import subprocess
 import sys
 import tarfile
+import threading
 import unicodedata
 import urllib.request
 import zipfile
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
@@ -25,7 +27,7 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 RUST_SILK_URL = (
@@ -56,6 +58,8 @@ SENSITIVE_TEMP_ROOT_NAME = "wechat-chat-export-sensitive"
 LEGACY_WECHATAUTO_CACHE_NAME = "wechatauto_db"
 SENSITIVE_OWNER_MARKER = ".owner.json"
 UNMARKED_STALE_SECONDS = 24 * 60 * 60
+UPSTREAM_KEYS_ENV = "WECHATAUTO_KEYS_DIR"
+_SENSITIVE_SANDBOX_LOCK = threading.RLock()
 
 
 def sensitive_cache_locations() -> dict[str, str]:
@@ -91,6 +95,34 @@ def _create_sensitive_workdir() -> Path:
         pass
 
     return workdir
+
+
+@contextmanager
+def _upstream_sensitive_sandbox(workdir: Path):
+    # Keep wechatauto 1.2.4.4 key caches inside the current run-* directory.
+    workdir = Path(workdir)
+    stable_keys = workdir / "upstream-stable-keys"
+    upstream_temp = workdir / "upstream-temp"
+    stable_keys.mkdir(parents=True, exist_ok=True)
+    upstream_temp.mkdir(parents=True, exist_ok=True)
+
+    # tempfile.tempdir is process-global. Serialize the whole export sandbox,
+    # then restore both settings in finally.
+    with _SENSITIVE_SANDBOX_LOCK:
+        had_env = UPSTREAM_KEYS_ENV in os.environ
+        old_env = os.environ.get(UPSTREAM_KEYS_ENV)
+        old_tempdir = tempfile.tempdir
+        os.environ[UPSTREAM_KEYS_ENV] = str(stable_keys)
+        tempfile.tempdir = str(upstream_temp)
+        try:
+            yield
+        finally:
+            tempfile.tempdir = old_tempdir
+            if had_env:
+                os.environ[UPSTREAM_KEYS_ENV] = old_env or ""
+            else:
+                os.environ.pop(UPSTREAM_KEYS_ENV, None)
+
 
 def _pid_is_alive(pid) -> bool:
     try:
@@ -1188,10 +1220,11 @@ def _write_image_from_row(
     dat_path = None
     variant = "original"
     if file_hash:
-        # 顺序：普通图 → 高清图 → 加密缩略图
+        # 顺序：高清/原图 _h.dat → 普通压缩图 .dat → 加密缩略图 _t.dat。
+        # wechatauto 1.2.4.2/1.2.4.3 已确认 _h.dat 是更高质量来源。
         for suffix, var in (
-            (".dat", "original"),
             ("_h.dat", "high"),
+            (".dat", "original"),
             ("_t.dat", "thumbnail-dat"),
         ):
             candidate = image_index.get((file_hash + suffix).lower())
@@ -2775,18 +2808,21 @@ def export_chat(
 
     result = None
     try:
-        result = _export_chat_impl(
-            keyword,
-            out_root=out_root,
-            progress=progress,
-            export_images=export_images,
-            export_files=export_files,
-            export_voices=export_voices,
-            export_videos=export_videos,
-            transcribe_voices=transcribe_voices,
-            db_dir=db_dir,
-            workdir=str(workdir),
-        )
+        # Enter before WeChatDB construction: upstream may write durable keys
+        # or switch account workdirs during __init__.
+        with _upstream_sensitive_sandbox(workdir):
+            result = _export_chat_impl(
+                keyword,
+                out_root=out_root,
+                progress=progress,
+                export_images=export_images,
+                export_files=export_files,
+                export_voices=export_voices,
+                export_videos=export_videos,
+                transcribe_voices=transcribe_voices,
+                db_dir=db_dir,
+                workdir=str(workdir),
+            )
     except BaseException:
         # KeyboardInterrupt / SystemExit 也先尽力删除本次敏感工作目录，再原样抛出。
         _cleanup_sensitive_workdir(workdir, progress=progress)

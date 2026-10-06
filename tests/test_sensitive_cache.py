@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -135,6 +136,79 @@ class SensitiveCacheTests(unittest.TestCase):
 
             self.assertEqual(cleanup.call_count, 1)
             self.assertTrue(result["sensitive_cache_cleanup"])
+
+    def test_upstream_sensitive_paths_are_sandboxed_and_restored(self):
+        with tempfile.TemporaryDirectory() as td:
+            prev_present = self.core.UPSTREAM_KEYS_ENV in os.environ
+            prev_env = os.environ.get(self.core.UPSTREAM_KEYS_ENV)
+            prev_tempdir = tempfile.tempdir
+            seen = {}
+            try:
+                os.environ[self.core.UPSTREAM_KEYS_ENV] = "sentinel-before-export"
+                tempfile.tempdir = td
+
+                def fake_impl(keyword, **kwargs):
+                    workdir = Path(kwargs["workdir"])
+                    seen["workdir"] = workdir
+                    stable = Path(os.environ[self.core.UPSTREAM_KEYS_ENV])
+                    upstream_temp = Path(tempfile.gettempdir())
+                    self.assertEqual(stable, workdir / "upstream-stable-keys")
+                    self.assertEqual(upstream_temp, workdir / "upstream-temp")
+                    (stable / "account.json").write_text("durable key", encoding="utf-8")
+                    fallback = upstream_temp / "wechatauto_db" / "account"
+                    fallback.mkdir(parents=True)
+                    (fallback / "keys.json").write_text("fallback key", encoding="utf-8")
+                    return {"chat_name": keyword}
+
+                with patch.object(self.core, "_export_chat_impl", side_effect=fake_impl):
+                    result = self.core.export_chat("Synthetic")
+
+                self.assertTrue(result["sensitive_cache_cleanup"])
+                self.assertFalse(seen["workdir"].exists())
+                self.assertEqual(os.environ.get(self.core.UPSTREAM_KEYS_ENV),
+                                 "sentinel-before-export")
+                self.assertEqual(tempfile.tempdir, td)
+            finally:
+                tempfile.tempdir = prev_tempdir
+                if prev_present:
+                    os.environ[self.core.UPSTREAM_KEYS_ENV] = prev_env or ""
+                else:
+                    os.environ.pop(self.core.UPSTREAM_KEYS_ENV, None)
+
+    def test_upstream_sensitive_sandbox_restores_settings_on_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            prev_present = self.core.UPSTREAM_KEYS_ENV in os.environ
+            prev_env = os.environ.get(self.core.UPSTREAM_KEYS_ENV)
+            prev_tempdir = tempfile.tempdir
+            seen = {}
+            try:
+                os.environ.pop(self.core.UPSTREAM_KEYS_ENV, None)
+                tempfile.tempdir = td
+
+                def fake_impl(keyword, **kwargs):
+                    workdir = Path(kwargs["workdir"])
+                    seen["workdir"] = workdir
+                    self.assertEqual(
+                        Path(os.environ[self.core.UPSTREAM_KEYS_ENV]),
+                        workdir / "upstream-stable-keys",
+                    )
+                    self.assertEqual(Path(tempfile.gettempdir()),
+                                     workdir / "upstream-temp")
+                    raise RuntimeError("synthetic sandbox failure")
+
+                with patch.object(self.core, "_export_chat_impl", side_effect=fake_impl):
+                    with self.assertRaisesRegex(RuntimeError, "synthetic sandbox failure"):
+                        self.core.export_chat("Synthetic")
+
+                self.assertFalse(seen["workdir"].exists())
+                self.assertNotIn(self.core.UPSTREAM_KEYS_ENV, os.environ)
+                self.assertEqual(tempfile.tempdir, td)
+            finally:
+                tempfile.tempdir = prev_tempdir
+                if prev_present:
+                    os.environ[self.core.UPSTREAM_KEYS_ENV] = prev_env or ""
+                else:
+                    os.environ.pop(self.core.UPSTREAM_KEYS_ENV, None)
 
     def test_startup_cleanup_removes_dead_run_but_preserves_active_and_legacy(self):
         with tempfile.TemporaryDirectory() as td:

@@ -4,7 +4,7 @@
 
 Repository: https://github.com/fanyuantaier/wechatauto-replica
 
-Pinned commit: `04ef8cbde3862cff90b5f6b42c9ebfcea44ef48d`  
+Version: `1.2.4.4` (PyPI, exact version pin)
 License: Apache License 2.0
 
 Used for low-level access to the local Windows WeChat database.
