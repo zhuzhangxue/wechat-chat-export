@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+    open-pull-requests-limit: 1
+    rebase-strategy: "auto"
+    allow:
+      - dependency-name: "wechatauto-replica"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
