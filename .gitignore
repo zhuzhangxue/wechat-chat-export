@@ -8,6 +8,10 @@ wechatauto_db/
 *.sqlite
 *.sqlite3
 
+# 上游依赖 wechatauto-replica 会在当前工作目录生成的日志与默认下载目录
+wechatauto_logs/
+wechatauto文件下载/
+
 # Python 缓存与构建文件
 __pycache__/
 *.py[cod]

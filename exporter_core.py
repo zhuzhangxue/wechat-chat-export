@@ -27,7 +27,7 @@ import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
 
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.4.0"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 RUST_SILK_URL = (
@@ -97,6 +97,37 @@ def _create_sensitive_workdir() -> Path:
     return workdir
 
 
+def _mute_upstream_file_logger():
+    """导出期间关闭上游的文件日志，返回原值（无法处理时返回 None）。
+
+    上游 WxParam.ENABLE_FILE_LOGGER 默认为 True，且第一次写日志时会
+    `Path("wechatauto_logs").mkdir(...)`——这是相对当前工作目录的路径，所以每次
+    导出都会在仓库/EXE 所在目录留下日志；从只读目录运行时这个 mkdir 还可能直接
+    抛错。这里按本项目既有做法，导出期间临时关闭、结束后恢复。
+    """
+    try:
+        from wechatauto.param import WxParam
+    except Exception:
+        return None
+    try:
+        previous = WxParam.ENABLE_FILE_LOGGER
+        WxParam.ENABLE_FILE_LOGGER = False
+    except Exception:
+        return None
+    return previous
+
+
+def _restore_upstream_file_logger(previous):
+    if previous is None:
+        return
+    try:
+        from wechatauto.param import WxParam
+
+        WxParam.ENABLE_FILE_LOGGER = previous
+    except Exception:
+        pass
+
+
 @contextmanager
 def _upstream_sensitive_sandbox(workdir: Path):
     # Keep wechatauto 1.2.4.4 key caches inside the current run-* directory.
@@ -112,6 +143,7 @@ def _upstream_sensitive_sandbox(workdir: Path):
         had_env = UPSTREAM_KEYS_ENV in os.environ
         old_env = os.environ.get(UPSTREAM_KEYS_ENV)
         old_tempdir = tempfile.tempdir
+        old_file_logger = _mute_upstream_file_logger()
         os.environ[UPSTREAM_KEYS_ENV] = str(stable_keys)
         tempfile.tempdir = str(upstream_temp)
         try:
@@ -122,6 +154,7 @@ def _upstream_sensitive_sandbox(workdir: Path):
                 os.environ[UPSTREAM_KEYS_ENV] = old_env or ""
             else:
                 os.environ.pop(UPSTREAM_KEYS_ENV, None)
+            _restore_upstream_file_logger(old_file_logger)
 
 
 def _pid_is_alive(pid) -> bool:
@@ -2413,7 +2446,7 @@ def _write_markdown(parsed: list[dict], path: Path, is_group: bool, target_name:
 
 
 def _export_chat_impl(
-    keyword: str,
+    keyword=None,
     out_root="exports",
     progress=None,
     export_images=False,
@@ -2423,6 +2456,10 @@ def _export_chat_impl(
     transcribe_voices=False,
     db_dir=None,
     workdir=None,
+    db=None,
+    contact=None,
+    folder_name=None,
+    index_cache=None,
 ):
     def log(msg):
         if progress:
@@ -2431,16 +2468,26 @@ def _export_chat_impl(
     if transcribe_voices:
         export_voices = True
 
-    if db_dir:
-        db_dir = resolve_db_dir(db_dir)
-        log(f"正在连接微信本地数据库…（指定目录：{db_dir}）")
-    else:
-        log("正在连接微信本地数据库…")
+    if db is None:
+        if db_dir:
+            db_dir = resolve_db_dir(db_dir)
+            log(f"正在连接微信本地数据库…（指定目录：{db_dir}）")
+        else:
+            log("正在连接微信本地数据库…")
+        db = WeChatDB(db_dir=db_dir, workdir=workdir)
 
-    db = WeChatDB(db_dir=db_dir, workdir=workdir)
-    target = find_contact(db, keyword)
-    username = target["username"]
-    target_name = target.get("remark") or target.get("nick_name") or keyword
+    if contact is not None:
+        # 批量导出时联系人已由 list_contacts() 解析完成；直接用稳定的
+        # username，避免对每个会话再做一次关键词匹配。
+        username = contact["username"]
+        target_name = contact.get("name") or username
+    elif keyword:
+        target = find_contact(db, keyword)
+        username = target["username"]
+        target_name = target.get("remark") or target.get("nick_name") or keyword
+    else:
+        raise ValueError("必须提供会话关键词或已解析的联系人。")
+
     is_group = username.endswith("@chatroom")
     log(f"已识别：{'群聊' if is_group else '私聊'} · {target_name}")
     log("正在读取消息…")
@@ -2449,13 +2496,21 @@ def _export_chat_impl(
         raise ValueError("没有读取到该会话的消息。")
 
     out_root = Path(out_root)
-    chat_dir = out_root / safe_folder_name(target_name)
+    chat_dir = out_root / safe_folder_name(folder_name or target_name)
     chat_dir.mkdir(parents=True, exist_ok=True)
-    self_info = db.get_self_info()
-    # get_self_info already uses the dependency's account-directory normalization.
-    # Compare its stable username exactly; never strip suffixes from message IDs.
-    self_username = _identity_username(self_info.get("username"))
-    nicks = db._nickname_index()
+    # 本机账号与群昵称表属于账号级信息：批量导出时整批只读取一次。
+    cache = index_cache if index_cache is not None else {}
+    if "self_username" in cache:
+        self_username = cache["self_username"]
+        nicks = cache["nicks"]
+    else:
+        self_info = db.get_self_info()
+        # get_self_info already uses the dependency's account-directory normalization.
+        # Compare its stable username exactly; never strip suffixes from message IDs.
+        self_username = _identity_username(self_info.get("username"))
+        nicks = db._nickname_index()
+        cache["self_username"] = self_username
+        cache["nicks"] = nicks
     parsed = []
     type_counts = {}
     sender_counts = Counter()
@@ -2545,8 +2600,13 @@ def _export_chat_impl(
         if image_rows_exist:
             log("正在定位本机图片缓存…")
             image_index = _index_image_files(db, username)
+            # 图片解密配置与 AES 密钥属于账号级信息，批量导出时复用同一份探测结果。
             log("正在准备图片解密配置…")
-            cfg_dword, cfg_error = _ensure_cfg_dword(db)
+            if "cfg_dword" in cache:
+                cfg_dword, cfg_error = cache["cfg_dword"], cache.get("cfg_error")
+            else:
+                cfg_dword, cfg_error = _ensure_cfg_dword(db)
+                cache["cfg_dword"], cache["cfg_error"] = cfg_dword, cfg_error
             if cfg_dword:
                 try:
                     md._cfg_dword = cfg_dword
@@ -2556,13 +2616,26 @@ def _export_chat_impl(
             elif cfg_error:
                 log(f"图片解密配置暂未获取：{cfg_error}")
             if image_index:
-                image_keys = _detect_image_keys_fast(md)
-                log("图片解密密钥已就绪。" if image_keys else "未获取到图片解密密钥；将优先回退导出微信明文缩略图。")
+                if "image_keys" in cache:
+                    image_keys = cache["image_keys"]
+                    log("复用已探测的图片解密密钥。")
+                else:
+                    image_keys = _detect_image_keys_fast(md)
+                    if index_cache is not None:
+                        index_cache["image_keys"] = image_keys
+                    log("图片解密密钥已就绪。" if image_keys else "未获取到图片解密密钥；将优先回退导出微信明文缩略图。")
 
         if file_rows_exist:
-            log("正在索引本机文件缓存…")
-            file_index = _index_local_files(db)
-            log(f"已索引本机文件缓存：{file_index.get('count', 0)} 个文件。")
+            # 文件缓存索引与具体会话无关，批量导出时整个账号只建一次。
+            file_index = index_cache.get("files") if index_cache is not None else None
+            if file_index is None:
+                log("正在索引本机文件缓存…")
+                file_index = _index_local_files(db)
+                if index_cache is not None:
+                    index_cache["files"] = file_index
+                log(f"已索引本机文件缓存：{file_index.get('count', 0)} 个文件。")
+            else:
+                log(f"复用已索引的本机文件缓存：{file_index.get('count', 0)} 个文件。")
 
         if video_rows_exist:
             log("正在索引本机视频缓存…")
@@ -2822,6 +2895,758 @@ def export_chat(
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
                 workdir=str(workdir),
+            )
+    except BaseException:
+        # KeyboardInterrupt / SystemExit 也先尽力删除本次敏感工作目录，再原样抛出。
+        _cleanup_sensitive_workdir(workdir, progress=progress)
+        raise
+
+    cleanup_ok, cleanup_error = _cleanup_sensitive_workdir(
+        workdir,
+        progress=progress,
+    )
+    result["sensitive_cache_cleanup"] = cleanup_ok
+    result["sensitive_cache_cleanup_error"] = cleanup_error
+    return result
+
+
+# 非会话账号：系统号与服务号/公众号。企业微信、客服等带 @ 后缀的账号仍按私聊
+# 导出，避免把真实会话误删。
+_SPECIAL_CONTACT_EXACT = frozenset({
+    "filehelper", "fmessage", "floatbottle", "medianote", "newsapp",
+    "weixin", "weixinreminder", "notifymessage", "qqmail", "tmessage",
+    "qmessage", "mphelper", "weibo", "weixinloglevel",
+    # 品牌服务会话占位账号（实测出现在联系人表里，但不是真实会话）。
+    "brandservicesessionholder", "brandsessionholder",
+})
+_SPECIAL_CONTACT_PREFIXES = ("gh_",)
+_MD5_ONLY_RE = re.compile(r"[0-9a-f]{32}")
+_CONTACT_USERNAME_COLUMNS = ("user_name", "username")
+_CONTACT_NAME_COLUMNS = ("remark", "nick_name", "nickname", "alias", "name")
+
+
+def _is_special_contact(username: str) -> bool:
+    """判断是否为系统号/公众号等非会话账号。"""
+    low = username.casefold()
+    if low in _SPECIAL_CONTACT_EXACT:
+        return True
+    return low.startswith(_SPECIAL_CONTACT_PREFIXES)
+
+
+def _set_display_name(names: dict, username, display) -> None:
+    if username not in names:
+        names[username] = ""
+    text = str(display).strip() if display is not None else ""
+    if text and not names[username]:
+        names[username] = text
+
+
+def _nickname_candidates(db) -> dict:
+    """上游昵称索引：username → 显示名。"""
+    names = {}
+    try:
+        index = db._nickname_index() or {}
+    except Exception:
+        return names
+    try:
+        items = index.items()
+    except AttributeError:
+        return names
+    for username, display in items:
+        value = _identity_username(username)
+        if value:
+            _set_display_name(names, value, display)
+    return names
+
+
+def _contact_db_candidates(db) -> dict:
+    """直接读取 contact / session 库里的联系人表：username → 显示名。
+
+    表名和列名按结构探测，不写死具体版本，以容忍微信 4.x 的库结构变化。
+    """
+    names = {}
+    rels = []
+    for basename in ("contact.db", "session.db"):
+        try:
+            rel = _find_db_rel(db, basename)
+        except Exception:
+            rel = None
+        if rel and rel not in rels:
+            rels.append(rel)
+    # 少数版本会把联系人库放在别的文件名下，按名字线索补一遍。
+    for item in getattr(db, "_db_files", []) or []:
+        try:
+            rel, path = item[0], item[1]
+        except Exception:
+            continue
+        base = Path(str(path)).name.casefold()
+        if ("contact" in base or "session" in base) and rel not in rels:
+            rels.append(rel)
+
+    for rel in rels:
+        try:
+            conn = db._open(rel)
+        except Exception:
+            continue
+        try:
+            try:
+                tables = [
+                    row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                ]
+            except Exception:
+                continue
+            for table in tables:
+                if not isinstance(table, str):
+                    continue
+                safe_table = table.replace('"', '""')
+                try:
+                    columns = [
+                        row[1] for row in conn.execute(
+                            f'PRAGMA table_info("{safe_table}")'
+                        ).fetchall()
+                    ]
+                except Exception:
+                    continue
+                lowered = {str(c).casefold(): c for c in columns}
+                user_col = next(
+                    (
+                        lowered[key]
+                        for key in _CONTACT_USERNAME_COLUMNS
+                        if key in lowered
+                    ),
+                    None,
+                )
+                if not user_col:
+                    continue
+                name_cols = [
+                    lowered[key] for key in _CONTACT_NAME_COLUMNS if key in lowered
+                ]
+                selected = ", ".join(
+                    [f'"{user_col}"'] + [f'"{col}"' for col in name_cols]
+                )
+                try:
+                    rows = conn.execute(
+                        f'SELECT {selected} FROM "{safe_table}"'
+                    ).fetchall()
+                except Exception:
+                    continue
+                for row in rows:
+                    username = _identity_username(row[0])
+                    if not username:
+                        continue
+                    display = ""
+                    for value in row[1:]:
+                        text = str(value).strip() if value is not None else ""
+                        if text:
+                            display = text
+                            break
+                    _set_display_name(names, username, display)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return names
+
+
+def _upstream_contact_candidates(db) -> dict:
+    """若上游提供联系人枚举 API，则一并采信（只取 username 与显示名）。"""
+    names = {}
+    for method in (
+        "get_contacts", "list_contacts", "get_contact_list",
+        "get_friends", "get_friend_list",
+    ):
+        func = getattr(db, method, None)
+        if not callable(func):
+            continue
+        try:
+            raw = func()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        try:
+            items = raw.values() if isinstance(raw, dict) else raw
+            for item in items:
+                if isinstance(item, dict):
+                    username = (
+                        item.get("username") or item.get("user_name")
+                        or item.get("UserName")
+                    )
+                    display = (
+                        item.get("remark") or item.get("nick_name")
+                        or item.get("nickname") or item.get("name") or ""
+                    )
+                elif isinstance(item, str):
+                    username, display = item, ""
+                else:
+                    username = (
+                        getattr(item, "username", None)
+                        or getattr(item, "user_name", None)
+                    )
+                    display = (
+                        getattr(item, "remark", "") or getattr(item, "nick_name", "")
+                    )
+                value = _identity_username(username)
+                if value:
+                    _set_display_name(names, value, display)
+        except Exception:
+            continue
+        if names:
+            break
+    return names
+
+
+def _session_candidates(db) -> dict:
+    """上游会话列表：username → 最近会话时间。
+
+    get_sessions() 由上游按最近会话时间倒序返回，并已过滤隐藏会话；它默认只取
+    100 条，这里显式放大 limit，尽量一次拿到全部会话。
+    """
+    meta = {}
+    func = getattr(db, "get_sessions", None)
+    if not callable(func):
+        return meta
+    raw = None
+    for kwargs in ({"limit": 1000000}, {}):
+        try:
+            raw = func(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            return meta
+        break
+    for item in raw or []:
+        try:
+            if isinstance(item, dict):
+                username = item.get("username")
+                last_time = item.get("last_time")
+            else:
+                username = getattr(item, "username", None)
+                last_time = getattr(item, "last_time", None)
+        except Exception:
+            continue
+        value = _identity_username(username)
+        if not value:
+            continue
+        entry = meta.setdefault(value, {})
+        try:
+            if last_time:
+                entry["last_time"] = int(last_time)
+        except Exception:
+            pass
+    return meta
+
+
+def _scan_message_shards(db):
+    """一次遍历消息分片，返回 (Name2Id 里的 username 集合, Msg_<md5> 的 md5 集合)。
+
+    只读 sqlite_master 与 Name2Id，不遍历消息本体，因此很便宜。
+    """
+    usernames = set()
+    hashes = set()
+    try:
+        shards = list(db._message_dbs())
+    except Exception:
+        return usernames, hashes
+    for rel in shards:
+        try:
+            conn = db._open(rel)
+        except Exception:
+            continue
+        try:
+            try:
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name LIKE 'Msg_%'"
+                ).fetchall():
+                    name = row[0]
+                    if isinstance(name, str) and len(name) == 36:
+                        hashes.add(name[4:].casefold())
+            except Exception:
+                pass
+            try:
+                for row in conn.execute(
+                    "SELECT DISTINCT user_name FROM Name2Id"
+                ).fetchall():
+                    value = _identity_username(row[0])
+                    if value:
+                        usernames.add(value)
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return usernames, hashes
+
+
+def _has_message_table(username: str, hashes) -> bool:
+    """该 username 是否有自己的会话表 Msg_<md5(username)>。
+
+    必须按 username 算 md5 反查，而不能用 Name2Id 交集：群聊消息的
+    real_sender_id 指向群成员，群本身的 username 往往不在 Name2Id 里。
+    """
+    return hashlib.md5(username.encode("utf-8")).hexdigest() in hashes
+
+
+def _list_message_chats_usernames(db):
+    """上游 list_message_chats() 兜底：只取 username，并过滤 md5 回退值。
+
+    该方法会对每张消息表做 COUNT(*)，在大账号上明显更慢，所以只在本机分片扫描
+    完全拿不到结果时才调用。
+    """
+    usernames = set()
+    func = getattr(db, "list_message_chats", None)
+    if not callable(func):
+        return usernames
+    try:
+        raw = func()
+    except Exception:
+        return usernames
+    for item in raw or []:
+        if hasattr(item, "get"):
+            username = item.get("username")
+        elif isinstance(item, str):
+            username = item
+        else:
+            username = None
+        value = _identity_username(username)
+        # 上游反查不到用户名时会回退成 md5 字符串本身，那不是可用会话。
+        if value and not _MD5_ONLY_RE.fullmatch(value):
+            usernames.add(value)
+    return usernames
+
+
+def list_contacts(
+    db: WeChatDB,
+    include_private=True,
+    include_group=True,
+    progress=None,
+):
+    """枚举本机全部私聊与群聊。
+
+    多个来源取并集（上游昵称表、contact/session 库、上游联系人枚举 API、上游会话
+    列表、有消息记录的会话），因此任一来源缺失或结构变化时仍能尽量列全。返回按
+    「私聊优先 + 名称」排序的列表，每项包含 username、显示名 name、is_group，以及
+    可选的最近会话时间 last_time 与消息数 message_count（拿不到时为 None）。
+    """
+    names = {}
+    for source in (
+        _nickname_candidates(db),
+        _contact_db_candidates(db),
+        _upstream_contact_candidates(db),
+    ):
+        for username, display in source.items():
+            _set_display_name(names, username, display)
+
+    session_meta = _session_candidates(db)
+    for username in session_meta:
+        _set_display_name(names, username, "")
+
+    # 会话表索引：决定“哪些会话真的有消息”，也就是默认要导出哪些。
+    shard_usernames, hashes = _scan_message_shards(db)
+    index_available = bool(hashes)
+    if index_available:
+        for username in shard_usernames:
+            if _has_message_table(username, hashes):
+                _set_display_name(names, username, "")
+    else:
+        # 分片扫描不可用时的兜底发现来源（较慢，只在必要时调用）。
+        for username in _list_message_chats_usernames(db):
+            _set_display_name(names, username, "")
+
+    chats = []
+    skipped_special = 0
+    for username, display in names.items():
+        is_group = username.casefold().endswith("@chatroom")
+        if is_group:
+            if not include_group:
+                continue
+        else:
+            if not include_private:
+                continue
+            if _is_special_contact(username):
+                skipped_special += 1
+                continue
+        chats.append({
+            "username": username,
+            "name": display or username,
+            "is_group": is_group,
+            # True/False 表示已确认有无会话表；None 表示本机建不了索引，按未知处理。
+            "has_messages": (
+                _has_message_table(username, hashes) if index_available else None
+            ),
+            "last_time": session_meta.get(username, {}).get("last_time"),
+        })
+
+    chats.sort(
+        key=lambda item: (
+            item["is_group"],
+            item["name"].casefold(),
+            item["username"],
+        )
+    )
+    if skipped_special and progress:
+        progress(f"已跳过 {skipped_special} 个系统号/公众号等非会话账号。")
+    return chats
+
+
+def _contact_priority(item):
+    """批量导出的处理顺序：最近的会话优先，其余按私聊/群聊与名称稳定排序。"""
+    last_time = item.get("last_time")
+    known = last_time if isinstance(last_time, int) and last_time > 0 else 0
+    return (
+        0 if known else 1,
+        -known,
+        item["is_group"],
+        item["name"].casefold(),
+        item["username"],
+    )
+
+
+def _format_last_time(value) -> str:
+    """把会话的最后时间戳格式化成可读文本；超出合理范围时返回空串。"""
+    seconds = _normalize_timestamp(value)
+    if not seconds or seconds < 946684800 or seconds > 4102444800:
+        return ""
+    try:
+        return datetime.fromtimestamp(seconds).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+
+def _unique_chat_folder(name, username, used):
+    """为批量导出生成互不冲突的会话文件夹名。
+
+    同名联系人或群聊追加稳定 username 作为区分；截断时会先给后缀留出空间，
+    避免 safe_folder_name 的 100 字符上限把区分后缀截掉而再次冲突。
+    """
+    base = safe_folder_name(name)
+    candidate = base
+    if candidate.casefold() in used:
+        suffix = safe_file_name(username, "id")[:40]
+        stem = base[: max(1, 96 - len(suffix))]
+        candidate = safe_folder_name(f"{stem} ({suffix})")
+        index = 2
+        while candidate.casefold() in used:
+            candidate = safe_folder_name(f"{stem} ({suffix}-{index})")
+            index += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
+_STATUS_LABELS = {
+    "exported": "已导出",
+    "skipped_empty": "无消息",
+    "failed": "失败",
+}
+
+
+def _write_all_chats_index(out_root, chats, meta):
+    """写出批量导出的总索引（JSON + Markdown）。"""
+    out_root = Path(out_root)
+    json_path = out_root / "all_chats_index.json"
+    md_path = out_root / "all_chats_index.md"
+
+    with json_path.open("w", encoding="utf-8-sig") as f:
+        json.dump(
+            {"exporter_version": APP_VERSION, **meta, "chats": chats},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    lines = [
+        "# 全部聊天导出索引",
+        "",
+        f"- 导出器版本：{APP_VERSION}",
+        f"- 生成时间：{meta['generated_at']}",
+        f"- 发现会话：{meta['discovered_total']}"
+        f"（私聊 {meta['private_total']}，群聊 {meta['group_total']}）",
+        f"- 其中有消息记录：{meta['with_messages']}",
+    ]
+    if meta.get("skipped_no_messages"):
+        lines.append(
+            f"- 从未有消息、默认跳过：{meta['skipped_no_messages']}"
+            "（需要一并尝试时用 `--include-empty`）"
+        )
+    lines.extend([
+        f"- 本次处理：{meta['total']}",
+        f"- 成功导出：{meta['exported']}；无消息跳过：{meta['skipped_empty']}；失败：{meta['failed']}",
+        f"- 消息总数：{meta['total_messages']}",
+        "",
+    ])
+    if meta.get("limited"):
+        lines.append(f"- 注意：本次使用数量上限，只处理了最近的 {meta['total']} 个会话。")
+        lines.append("")
+    lines.extend([
+        "| 会话 | 类型 | 最近消息 | 消息数 | 文件夹 |",
+        "| --- | --- | --- | --- | --- |",
+    ])
+    for item in chats:
+        label = str(item.get("name") or item.get("username") or "").replace("|", "\\|")
+        if item["status"] == "exported":
+            folder = f"[{item['folder']}]({_markdown_href(item['folder'])})"
+        else:
+            folder = f"—（{_STATUS_LABELS.get(item['status'], item['status'])}）"
+        lines.append(
+            f"| {label} | {'群聊' if item['is_group'] else '私聊'} "
+            f"| {item.get('last_time_text') or '—'} "
+            f"| {item['message_count']} | {folder} |"
+        )
+    lines.append("")
+
+    with md_path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines))
+    return json_path, md_path
+
+
+def _export_all_chats_impl(
+    out_root="exports",
+    progress=None,
+    export_images=False,
+    export_files=False,
+    export_voices=False,
+    export_videos=False,
+    transcribe_voices=False,
+    db_dir=None,
+    workdir=None,
+    limit=None,
+    include_private=True,
+    include_group=True,
+    include_empty=False,
+):
+    def log(msg):
+        if progress:
+            progress(msg)
+
+    if transcribe_voices:
+        export_voices = True
+
+    if db_dir:
+        db_dir = resolve_db_dir(db_dir)
+        log(f"正在连接微信本地数据库…（指定目录：{db_dir}）")
+    else:
+        log("正在连接微信本地数据库…")
+
+    db = WeChatDB(db_dir=db_dir, workdir=str(workdir) if workdir else None)
+
+    log("正在枚举本机全部会话…")
+    contacts = list_contacts(
+        db,
+        include_private=include_private,
+        include_group=include_group,
+        progress=log,
+    )
+    private_total = sum(1 for item in contacts if not item["is_group"])
+    group_total = len(contacts) - private_total
+    if not contacts:
+        raise ValueError(
+            "没有发现可导出的私聊或群聊。请确认已登录微信并保持微信在后台运行；"
+            "如果数据目录被自行迁移过，请手动指定微信数据目录。"
+        )
+    discovered_total = len(contacts)
+    with_messages = sum(1 for item in contacts if item.get("has_messages"))
+    index_available = any(item.get("has_messages") is not None for item in contacts)
+    log(
+        f"共发现 {discovered_total} 个会话（私聊 {private_total}，群聊 {group_total}）。"
+    )
+
+    # 只加过好友、从未产生消息的联系人默认不逐个尝试：整批会白跑几千次。
+    pending = contacts
+    skipped_no_messages = 0
+    if index_available:
+        log(f"其中有消息记录 {with_messages} 个。")
+        if not include_empty:
+            pending = [item for item in contacts if item.get("has_messages")]
+            skipped_no_messages = discovered_total - len(pending)
+            if skipped_no_messages:
+                log(
+                    f"其余 {skipped_no_messages} 个从未在本机产生过消息，默认跳过"
+                    "（需要一并尝试时用 --include-empty）。"
+                )
+
+    # 先处理最近的会话：中断或使用数量上限时，优先拿到最可能需要的聊天。
+    pending = sorted(pending, key=_contact_priority)
+    limited = limit is not None and len(pending) > int(limit)
+    if limited:
+        pending = pending[: int(limit)]
+        log(f"已按数量上限只处理最靠前的 {len(pending)} 个会话（最近会话优先）。")
+    contacts = pending
+
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    used_folders = set()
+    # 账号级索引与密钥探测结果在整个批次内复用，避免每个会话重复扫描磁盘。
+    index_cache = {}
+    chats = []
+    total_messages = 0
+    counters = {"exported": 0, "skipped_empty": 0, "failed": 0}
+
+    for position, contact in enumerate(contacts, 1):
+        name = contact.get("name") or contact["username"]
+        folder = _unique_chat_folder(name, contact["username"], used_folders)
+        entry = {
+            "name": name,
+            "username": contact["username"],
+            "is_group": bool(contact["is_group"]),
+            "has_messages": bool(contact.get("has_messages")),
+            "last_time": contact.get("last_time"),
+            "last_time_text": _format_last_time(contact.get("last_time")),
+            "status": "failed",
+            "folder": folder,
+            "message_count": 0,
+            "output_dir": None,
+            "txt": None,
+            "md": None,
+            "json": None,
+            "media_stats": None,
+            "sender_resolution_counts": None,
+            "error": None,
+        }
+        kind = "群聊" if entry["is_group"] else "私聊"
+        log(f"[{position}/{len(contacts)}] {kind}：{name}")
+        try:
+            result = _export_chat_impl(
+                out_root=out_root,
+                progress=progress,
+                export_images=export_images,
+                export_files=export_files,
+                export_voices=export_voices,
+                export_videos=export_videos,
+                transcribe_voices=transcribe_voices,
+                db=db,
+                contact=contact,
+                folder_name=folder,
+                index_cache=index_cache,
+            )
+        except ValueError as exc:
+            # 没有消息的会话（例如只加了好友、从未聊天）不算失败。
+            entry["status"] = "skipped_empty"
+            entry["error"] = str(exc)
+            counters["skipped_empty"] += 1
+            log(f"跳过（{_STATUS_LABELS['skipped_empty']}）：{exc}")
+        except Exception as exc:  # 单个会话出错不影响其余会话
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            counters["failed"] += 1
+            log(f"该会话导出失败，已跳过并继续：{entry['error']}")
+        else:
+            entry.update({
+                "status": "exported",
+                "message_count": result["message_count"],
+                "output_dir": result["output_dir"],
+                "txt": result["txt"],
+                "md": result["md"],
+                "json": result["json"],
+                "media_stats": result["media_stats"],
+                "sender_resolution_counts": result["sender_resolution_counts"],
+            })
+            counters["exported"] += 1
+            total_messages += result["message_count"]
+        chats.append(entry)
+
+    meta = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "discovered_total": discovered_total,
+        "total": len(chats),
+        "private_total": private_total,
+        "group_total": group_total,
+        "with_messages": with_messages,
+        "skipped_no_messages": skipped_no_messages,
+        "include_empty": bool(include_empty),
+        "limited": limited,
+        "exported": counters["exported"],
+        "skipped_empty": counters["skipped_empty"],
+        "failed": counters["failed"],
+        "total_messages": total_messages,
+        "export_images": bool(export_images),
+        "export_files": bool(export_files),
+        "export_voices": bool(export_voices),
+        "export_videos": bool(export_videos),
+        "transcribe_voices": bool(transcribe_voices),
+    }
+    json_path, md_path = _write_all_chats_index(out_root, chats, meta)
+
+    log(
+        f"全部完成：成功 {counters['exported']}、无消息跳过 {counters['skipped_empty']}、"
+        f"失败 {counters['failed']}；共 {total_messages} 条消息。"
+    )
+    log(f"总索引：{md_path}")
+    if counters["failed"]:
+        failed_names = "；".join(
+            f"{item['name']}（{item['error']}）"
+            for item in chats
+            if item["status"] == "failed"
+        )
+        log(f"导出失败的会话：{failed_names}")
+
+    return {
+        **meta,
+        "output_dir": str(out_root.resolve()),
+        "index_json": str(json_path.resolve()),
+        "index_md": str(md_path.resolve()),
+        "chats": chats,
+    }
+
+
+def export_all_chats(
+    out_root="exports",
+    progress=None,
+    export_images=False,
+    export_files=False,
+    export_voices=False,
+    export_videos=False,
+    transcribe_voices=False,
+    db_dir=None,
+    limit=None,
+    include_private=True,
+    include_group=True,
+    include_empty=False,
+):
+    """导出本机全部私聊与群聊，每个会话一个文件夹，并生成总索引。
+
+    与 export_chat() 的区别是整批只打开一次数据库、只建一次敏感临时工作目录，
+    单个会话失败不会中断整批导出。默认只处理本机确实有消息记录的会话；只加过
+    好友、从未聊过的联系人会汇总跳过，include_empty=True 时才逐个尝试。
+    """
+    if limit is not None and int(limit) <= 0:
+        # 否则 limit=0 会被当成“不限量”，与直觉相反。
+        raise ValueError("会话数量上限（limit）必须是正整数。")
+
+    # 导出前顺便清理本项目上次异常退出留下、且已确认失效的工作目录。
+    stale_report = clear_current_sensitive_cache()
+    if progress and stale_report.get("removed"):
+        progress(
+            f"已自动清理 {len(stale_report['removed'])} 个上次异常退出留下的敏感临时目录。"
+        )
+
+    workdir = _create_sensitive_workdir()
+    if progress:
+        progress("敏感数据库密钥和解密缓存将使用一次性临时目录，导出结束后自动清理。")
+
+    result = None
+    try:
+        # Enter before WeChatDB construction: upstream may write durable keys
+        # or switch account workdirs during __init__.
+        with _upstream_sensitive_sandbox(workdir):
+            result = _export_all_chats_impl(
+                out_root=out_root,
+                progress=progress,
+                export_images=export_images,
+                export_files=export_files,
+                export_voices=export_voices,
+                export_videos=export_videos,
+                transcribe_voices=transcribe_voices,
+                db_dir=db_dir,
+                workdir=str(workdir),
+                limit=limit,
+                include_private=include_private,
+                include_group=include_group,
+                include_empty=include_empty,
             )
     except BaseException:
         # KeyboardInterrupt / SystemExit 也先尽力删除本次敏感工作目录，再原样抛出。
