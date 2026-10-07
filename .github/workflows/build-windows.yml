@@ -93,7 +93,13 @@ jobs:
               wechatauto.__version__,
           )
 
-          for name in ("_open", "_nickname_index", "extract_master_key"):
+          for name in (
+              "_open",
+              "_nickname_index",
+              "extract_master_key",
+              "get_sessions",
+              "list_message_chats",
+          ):
               assert hasattr(WeChatDB, name), name
           for name in (
               "_collect_templates",
