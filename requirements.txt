@@ -4,4 +4,4 @@ psutil
 imageio-ffmpeg
 sherpa-onnx==1.13.6
 soundfile>=0.12,<1
-wechatauto-replica==1.2.4.4
+wechatauto-replica==1.2.6
