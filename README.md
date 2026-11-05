@@ -35,6 +35,18 @@ Windows 版是单文件 EXE，不需要另外安装 Python。
 3. 如有需要，指定微信数据目录；
 4. 点击「开始导出」。
 
+## 界面语言 / UI language
+
+界面支持中文（默认）和俄语。切换方式：
+
+- GUI：窗口右上角选择「界面语言 / Language」后重启程序；
+- 环境变量：`WECHAT_EXPORT_LANG=ru`；
+- 命令行：`python cli.py --lang ru ...`。
+
+`--lang` 只影响当前运行，不保存到文件；GUI 选择会写入程序目录的 `ui_language.json`。导出的 TXT / Markdown / JSON 内容、文件名和内部错误信息保持中文不变。
+
+UI language: Chinese (default) or Russian. Use the GUI combo, `WECHAT_EXPORT_LANG=ru`, or `python cli.py --lang ru`. Exported files remain in Chinese.
+
 导出结果类似：
 
 ```text

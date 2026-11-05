@@ -11,6 +11,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
+from i18n import tr
+
 WECHAT_DATA_SUBDIRS = ("xwechat_files", "WeChat Files", "xwechat_files_data")
 _CONFIG_EXTS = {".ini", ".json", ".txt", ".cfg", ".conf", ".xml"}
 _WINDOWS_PATH_RE = re.compile(r"(?i)(?:[a-z]:[\\/][^\r\n\"'<>|?*]+)")
@@ -102,7 +104,7 @@ def _inspect_root(root: Path, sources: set[str], auto_root: Path | None) -> dict
     labels = set(sources)
     if auto_selected:
         labels.add("当前自动探测")
-    latest_text = datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M") if latest else "未知"
+    latest_text = datetime.fromtimestamp(latest).strftime("%Y-%m-%d %H:%M") if latest else tr("未知")
     return {
         "path": str(root),
         "account_count": len(accounts),
@@ -355,16 +357,18 @@ def choose_wechat_data_dir(parent, current: str | None = None) -> str | None:
 
     if not rows:
         messagebox.showinfo(
-            "微信数据目录",
-            "没有自动发现可确认的微信数据目录。\n\n"
-            "接下来可以手动浏览文件夹；通常选择微信“设置 → 文件管理”里显示的目录即可。",
+            tr("微信数据目录"),
+            tr(
+                "没有自动发现可确认的微信数据目录。\n\n"
+                "接下来可以手动浏览文件夹；通常选择微信“设置 → 文件管理”里显示的目录即可。"
+            ),
             parent=parent,
         )
         return _browse_other(parent, current)
 
     result = {"path": None}
     win = tk.Toplevel(parent)
-    win.title("选择微信数据目录")
+    win.title(tr("选择微信数据目录"))
     win.geometry("900x420")
     win.minsize(760, 330)
     win.transient(parent)
@@ -374,7 +378,7 @@ def choose_wechat_data_dir(parent, current: str | None = None) -> str | None:
 
     ttk.Label(
         win,
-        text="已发现以下微信数据目录。按数据库最近修改时间排序，较新的通常更可能是正在使用的数据。",
+        text=tr("已发现以下微信数据目录。按数据库最近修改时间排序，较新的通常更可能是正在使用的数据。"),
         wraplength=840,
     ).grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
 
@@ -385,10 +389,10 @@ def choose_wechat_data_dir(parent, current: str | None = None) -> str | None:
 
     columns = ("path", "accounts", "latest", "source")
     tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
-    tree.heading("path", text="目录")
-    tree.heading("accounts", text="账号")
-    tree.heading("latest", text="最新数据库")
-    tree.heading("source", text="发现来源")
+    tree.heading("path", text=tr("目录"))
+    tree.heading("accounts", text=tr("账号"))
+    tree.heading("latest", text=tr("最新数据库"))
+    tree.heading("source", text=tr("发现来源"))
     tree.column("path", width=430, anchor="w")
     tree.column("accounts", width=60, anchor="center", stretch=False)
     tree.column("latest", width=135, anchor="center", stretch=False)
@@ -400,6 +404,21 @@ def choose_wechat_data_dir(parent, current: str | None = None) -> str | None:
     scroll.grid(row=0, column=1, sticky="ns")
 
     row_by_iid: dict[str, dict] = {}
+
+    _SOURCE_LABELS = {
+        "当前输入": tr("当前输入"),
+        "自动探测": tr("自动探测"),
+        "微信配置": tr("微信配置"),
+        "注册表": tr("注册表"),
+        "常见位置": tr("常见位置"),
+        "磁盘浅层扫描": tr("磁盘浅层扫描"),
+        "当前自动探测": tr("当前自动探测"),
+    }
+
+    def _display_source(source: str) -> str:
+        for zh, ru in _SOURCE_LABELS.items():
+            source = source.replace(zh, ru)
+        return source.replace("、", ", ")
 
     def populate(items: list[dict]):
         for iid in tree.get_children():
@@ -418,7 +437,7 @@ def choose_wechat_data_dir(parent, current: str | None = None) -> str | None:
                     item["path"],
                     item["account_count"],
                     item["latest_text"],
-                    source,
+                    _display_source(source),
                 ),
             )
             row_by_iid[iid] = item
@@ -435,7 +454,7 @@ def choose_wechat_data_dir(parent, current: str | None = None) -> str | None:
 
     note = ttk.Label(
         win,
-        text="这里只做高可信来源 + 固定磁盘浅层扫描，不会递归扫完整个硬盘。找不到时可点“浏览其他目录”。",
+        text=tr("这里只做高可信来源 + 固定磁盘浅层扫描，不会递归扫完整个硬盘。找不到时可点“浏览其他目录”。"),
         foreground="#6b7280",
         wraplength=840,
     )
@@ -467,22 +486,25 @@ def choose_wechat_data_dir(parent, current: str | None = None) -> str | None:
             win.destroy()
 
     def rescan():
-        note.configure(text="正在重新扫描……")
+        note.configure(text=tr("正在重新扫描……"))
         win.configure(cursor="watch")
         win.update_idletasks()
         try:
             new_rows = discover_wechat_data_dirs(current)
             populate(new_rows)
             note.configure(
-                text=f"重新扫描完成，共发现 {len(new_rows)} 个候选。找不到时可点“浏览其他目录”。"
+                text=tr(
+                    "重新扫描完成，共发现 {count} 个候选。找不到时可点“浏览其他目录”。",
+                    count=len(new_rows),
+                )
             )
         finally:
             win.configure(cursor="")
 
-    ttk.Button(buttons, text="重新扫描", command=rescan).grid(row=0, column=1, padx=(0, 8))
-    ttk.Button(buttons, text="浏览其他目录", command=browse_other).grid(row=0, column=2, padx=(0, 8))
-    ttk.Button(buttons, text="取消", command=win.destroy).grid(row=0, column=3, padx=(0, 8))
-    ttk.Button(buttons, text="使用选中目录", command=use_selected).grid(row=0, column=4)
+    ttk.Button(buttons, text=tr("重新扫描"), command=rescan).grid(row=0, column=1, padx=(0, 8))
+    ttk.Button(buttons, text=tr("浏览其他目录"), command=browse_other).grid(row=0, column=2, padx=(0, 8))
+    ttk.Button(buttons, text=tr("取消"), command=win.destroy).grid(row=0, column=3, padx=(0, 8))
+    ttk.Button(buttons, text=tr("使用选中目录"), command=use_selected).grid(row=0, column=4)
 
     tree.bind("<Double-1>", use_selected)
     win.protocol("WM_DELETE_WINDOW", win.destroy)
