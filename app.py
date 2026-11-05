@@ -22,10 +22,11 @@ from exporter_core import (
     local_asr_status,
     rust_silk_status,
 )
+from i18n import SUPPORTED, get_language, set_language, tr
 from preview import open_chat_preview
 from wechat_data_dirs import choose_wechat_data_dir
 
-APP_TITLE = "微信聊天导出给大模型"
+APP_TITLE = tr("微信聊天导出给大模型")
 WECHAT_PROCESS_NAMES = {"weixin.exe", "wechat.exe"}
 
 # 与 EXE 文件图标使用同一套图形。
@@ -80,38 +81,52 @@ class App(tk.Tk):
 
         ttk.Label(
             pad,
-            text="微信聊天信息 → 大模型可读 TXT / Markdown / JSON",
+            text=tr("微信聊天信息 → 大模型可读 TXT / Markdown / JSON"),
             font=("Microsoft YaHei UI", 16, "bold"),
         ).grid(row=0, column=0, sticky="w")
 
+        lang_frame = ttk.Frame(pad)
+        lang_frame.grid(row=0, column=1, sticky="e")
+        ttk.Label(lang_frame, text=tr("界面语言 / Language")).pack(side="left")
+        self.lang_var = tk.StringVar(value=SUPPORTED.get(get_language(), "中文"))
+        lang_cb = ttk.Combobox(
+            lang_frame,
+            values=list(SUPPORTED.values()),
+            state="readonly",
+            textvariable=self.lang_var,
+            width=12,
+        )
+        lang_cb.pack(side="left", padx=(6, 0))
+        lang_cb.bind("<<ComboboxSelected>>", self._on_language_change)
+
         tk.Label(
             pad,
-            text="⚠ 使用前请先登录 Windows 微信，并保持微信在后台运行。",
+            text=tr("⚠ 使用前请先登录 Windows 微信，并保持微信在后台运行。"),
             fg="#b45309",
             font=("Microsoft YaHei UI", 10, "bold"),
         ).grid(row=1, column=0, sticky="w", pady=(8, 2))
 
         ttk.Label(
             pad,
-            text="支持私聊与群聊。输入准确备注名、昵称或群名；程序会自动识别。",
+            text=tr("支持私聊与群聊。输入准确备注名、昵称或群名；程序会自动识别。"),
         ).grid(row=2, column=0, sticky="w", pady=(2, 16))
 
         row = ttk.Frame(pad)
         row.grid(row=3, column=0, sticky="ew")
         row.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(row, text="好友 / 群聊：").grid(row=0, column=0, sticky="w")
+        ttk.Label(row, text=tr("好友 / 群聊：")).grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar()
         self.entry = ttk.Entry(row, textvariable=self.name_var)
         self.entry.grid(row=0, column=1, sticky="ew", padx=(8, 8))
         self.entry.bind("<Return>", lambda e: self.start_export())
 
-        self.export_btn = ttk.Button(row, text="开始导出", command=self.start_export)
+        self.export_btn = ttk.Button(row, text=tr("开始导出"), command=self.start_export)
         self.export_btn.grid(row=0, column=2)
 
         self.export_all_btn = ttk.Button(
             row,
-            text="导出全部聊天",
+            text=tr("导出全部聊天"),
             command=self.start_export_all,
         )
         self.export_all_btn.grid(row=0, column=3, padx=(8, 0))
@@ -120,34 +135,34 @@ class App(tk.Tk):
         outrow.grid(row=4, column=0, sticky="ew", pady=(12, 8))
         outrow.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(outrow, text="输出目录：").grid(row=0, column=0, sticky="w")
+        ttk.Label(outrow, text=tr("输出目录：")).grid(row=0, column=0, sticky="w")
         self.out_var = tk.StringVar(value=str(app_dir() / "exports"))
         ttk.Entry(outrow, textvariable=self.out_var).grid(
             row=0, column=1, sticky="ew", padx=(8, 8)
         )
-        ttk.Button(outrow, text="选择", command=self.choose_out).grid(row=0, column=2)
+        ttk.Button(outrow, text=tr("选择"), command=self.choose_out).grid(row=0, column=2)
 
         dbrow = ttk.Frame(pad)
         dbrow.grid(row=5, column=0, sticky="ew", pady=(0, 8))
         dbrow.grid_columnconfigure(1, weight=1)
 
-        ttk.Label(dbrow, text="微信数据目录：").grid(row=0, column=0, sticky="w")
+        ttk.Label(dbrow, text=tr("微信数据目录：")).grid(row=0, column=0, sticky="w")
         self.db_dir_var = tk.StringVar()
         ttk.Entry(dbrow, textvariable=self.db_dir_var).grid(
             row=0, column=1, sticky="ew", padx=(8, 8)
         )
-        ttk.Button(dbrow, text="选择", command=self.choose_db_dir).grid(
+        ttk.Button(dbrow, text=tr("选择"), command=self.choose_db_dir).grid(
             row=0, column=2
         )
         ttk.Label(
             dbrow,
-            text="留空自动探测；点“选择”可列出本机发现的微信数据目录，也可手动浏览。",
+            text=tr("留空自动探测；点“选择”可列出本机发现的微信数据目录，也可手动浏览。"),
             foreground="#6b7280",
         ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(2, 0))
 
         media_row = ttk.Frame(pad)
         media_row.grid(row=6, column=0, sticky="ew", pady=(2, 2))
-        ttk.Label(media_row, text="附带导出：").pack(side="left")
+        ttk.Label(media_row, text=tr("附带导出：")).pack(side="left")
 
         self.images_var = tk.BooleanVar(value=True)
         self.files_var = tk.BooleanVar(value=True)
@@ -156,27 +171,27 @@ class App(tk.Tk):
         self.transcribe_var = tk.BooleanVar(value=False)
 
         ttk.Checkbutton(
-            media_row, text="图片", variable=self.images_var
+            media_row, text=tr("图片"), variable=self.images_var
         ).pack(side="left", padx=(6, 8))
         ttk.Checkbutton(
-            media_row, text="文件", variable=self.files_var
+            media_row, text=tr("文件"), variable=self.files_var
         ).pack(side="left", padx=(0, 8))
         ttk.Checkbutton(
-            media_row, text="语音", variable=self.voices_var
+            media_row, text=tr("语音"), variable=self.voices_var
         ).pack(side="left", padx=(0, 8))
         ttk.Checkbutton(
-            media_row, text="视频", variable=self.videos_var
+            media_row, text=tr("视频"), variable=self.videos_var
         ).pack(side="left", padx=(0, 8))
         ttk.Checkbutton(
             media_row,
-            text="语音转文字（本地）",
+            text=tr("语音转文字（本地）"),
             variable=self.transcribe_var,
             command=self.on_transcribe_toggle,
         ).pack(side="left", padx=(0, 8))
 
         ttk.Label(
             pad,
-            text="仅导出本机仍有缓存的附件；“语音转文字（本地）”默认关闭，勾选后会自动同时导出语音。",
+            text=tr("仅导出本机仍有缓存的附件；“语音转文字（本地）”默认关闭，勾选后会自动同时导出语音。"),
         ).grid(row=7, column=0, sticky="w", pady=(2, 4))
 
         ttk.Separator(pad).grid(row=8, column=0, sticky="ew", pady=10)
@@ -195,7 +210,7 @@ class App(tk.Tk):
 
         self.clear_cache_btn = ttk.Button(
             bottom,
-            text="清除敏感缓存",
+            text=tr("清除敏感缓存"),
             command=self.clear_sensitive_cache_ui,
         )
         self.clear_cache_btn.grid(
@@ -204,7 +219,7 @@ class App(tk.Tk):
 
         self.existing_preview_btn = ttk.Button(
             bottom,
-            text="预览已有聊天",
+            text=tr("预览已有聊天"),
             command=self.open_existing_preview,
         )
         self.existing_preview_btn.grid(
@@ -212,7 +227,7 @@ class App(tk.Tk):
         )
         self.preview_btn = ttk.Button(
             bottom,
-            text="打开聊天预览",
+            text=tr("打开聊天预览"),
             command=self.open_preview,
             state="disabled",
         )
@@ -220,7 +235,7 @@ class App(tk.Tk):
 
         self.open_btn = ttk.Button(
             bottom,
-            text="打开导出文件夹",
+            text=tr("打开导出文件夹"),
             command=self.open_output,
             state="disabled",
         )
@@ -233,12 +248,11 @@ class App(tk.Tk):
         failed = startup_cache_report.get("failed") or []
         if removed:
             self.log(
-                f"已自动清理上次异常退出留下的敏感临时缓存：{len(removed)} 个目录。"
+                tr("已自动清理上次异常退出留下的敏感临时缓存：{count} 个目录。", count=len(removed))
             )
         if failed:
             self.log(
-                "检测到敏感临时缓存残留，但自动清理失败。"
-                "可在确认没有导出任务运行后使用‘清除敏感缓存’重试。"
+                tr("检测到敏感临时缓存残留，但自动清理失败。可在确认没有导出任务运行后使用‘清除敏感缓存’重试。")
             )
 
         self.entry.focus_set()
@@ -248,16 +262,35 @@ class App(tk.Tk):
         if self.transcribe_var.get():
             self.voices_var.set(True)
 
+    def _on_language_change(self, _event=None):
+        label_to_code = {v: k for k, v in SUPPORTED.items()}
+        code = label_to_code.get(self.lang_var.get(), "zh")
+        if code == get_language():
+            return
+        if not set_language(code):
+            messagebox.showerror(
+                APP_TITLE,
+                tr("保存界面语言设置失败，请检查程序目录写入权限。"),
+            )
+            return
+        messagebox.showinfo(
+            APP_TITLE,
+            "界面语言将在重启程序后生效。 / "
+            "Язык интерфейса изменится после перезапуска программы.",
+        )
+
     def clear_sensitive_cache_ui(self):
         confirmed = messagebox.askyesno(
             APP_TITLE,
-            "将清除本工具可能留下的敏感临时缓存，包括：\n\n"
-            "1. v1.3.4 当前版本的一次性临时工作目录；\n"
-            "2. v1.3.3 及更早版本 / wechatauto-replica 默认保存在 "
-            "%TEMP%\\wechatauto_db 下的数据库密钥、图片密钥和解密数据库缓存。\n\n"
-            "这不会删除微信原始聊天数据库，也不会删除已经导出的聊天结果。\n\n"
-            "如果还有其他程序正在使用 wechatauto-replica，请先关闭它们。\n\n"
-            "确定继续吗？",
+            tr(
+                "将清除本工具可能留下的敏感临时缓存，包括：\n\n"
+                "1. v1.3.4 当前版本的一次性临时工作目录；\n"
+                "2. v1.3.3 及更早版本 / wechatauto-replica 默认保存在 "
+                "%TEMP%\\wechatauto_db 下的数据库密钥、图片密钥和解密数据库缓存。\n\n"
+                "这不会删除微信原始聊天数据库，也不会删除已经导出的聊天结果。\n\n"
+                "如果还有其他程序正在使用 wechatauto-replica，请先关闭它们。\n\n"
+                "确定继续吗？"
+            ),
         )
         if not confirmed:
             return
@@ -266,7 +299,7 @@ class App(tk.Tk):
         self.export_all_btn.configure(state="disabled")
         self.clear_cache_btn.configure(state="disabled")
         self.log("")
-        self.log("正在清除敏感临时缓存…")
+        self.log(tr("正在清除敏感临时缓存…"))
         threading.Thread(
             target=self.clear_sensitive_cache_worker,
             daemon=True,
@@ -283,21 +316,21 @@ class App(tk.Tk):
             ))
 
     def choose_db_dir(self):
-        self.log("正在查找本机微信数据目录……")
+        self.log(tr("正在查找本机微信数据目录……"))
         try:
             path = choose_wechat_data_dir(
                 self,
                 current=self.db_dir_var.get().strip() or None,
             )
         except Exception as exc:
-            self.log(f"查找微信数据目录失败：{type(exc).__name__}: {exc}")
+            self.log(tr("查找微信数据目录失败：{error}", error=f"{type(exc).__name__}: {exc}"))
             path = filedialog.askdirectory(
                 parent=self,
                 initialdir=self.db_dir_var.get() or str(Path.home()),
             )
         if path:
             self.db_dir_var.set(path)
-            self.log(f"已选择微信数据目录：{path}")
+            self.log(tr("已选择微信数据目录：{path}", path=path))
 
     def choose_out(self):
         path = filedialog.askdirectory(
@@ -317,11 +350,13 @@ class App(tk.Tk):
         self.export_all_btn.configure(state=state)
 
     def _warn_wechat_not_running(self):
-        self.log("未检测到正在运行的 Windows 微信。")
+        self.log(tr("未检测到正在运行的 Windows 微信。"))
         messagebox.showwarning(
             APP_TITLE,
-            "未检测到正在运行的 Windows 微信。\n\n"
-            "请先启动并登录微信，保持微信在后台运行，然后重新开始导出。",
+            tr(
+                "未检测到正在运行的 Windows 微信。\n\n"
+                "请先启动并登录微信，保持微信在后台运行，然后重新开始导出。"
+            ),
         )
 
     def _check_media_ready(self, transcribe_voices):
@@ -330,17 +365,19 @@ class App(tk.Tk):
             if not ok:
                 install_now = messagebox.askyesno(
                     APP_TITLE,
-                    "当前没有找到 rust-silk 语音解码器。\n\n"
-                    "微信语音需要它才能从 SILK 转成 WAV；"
-                    "本地语音转文字也需要先得到 WAV。\n\n"
-                    "程序会从 rust-silk 官方 GitHub Release 下载固定的 v0.1.3，"
-                    "并在安装前校验 SHA-256。\n\n"
-                    "现在下载并安装吗？",
+                    tr(
+                        "当前没有找到 rust-silk 语音解码器。\n\n"
+                        "微信语音需要它才能从 SILK 转成 WAV；"
+                        "本地语音转文字也需要先得到 WAV。\n\n"
+                        "程序会从 rust-silk 官方 GitHub Release 下载固定的 v0.1.3，"
+                        "并在安装前校验 SHA-256。\n\n"
+                        "现在下载并安装吗？"
+                    ),
                 )
                 if install_now:
                     self._set_export_buttons("disabled")
                     self.log("")
-                    self.log("开始安装 rust-silk 语音解码器…")
+                    self.log(tr("开始安装 rust-silk 语音解码器…"))
                     threading.Thread(
                         target=self.install_rust_silk_worker,
                         daemon=True,
@@ -349,8 +386,10 @@ class App(tk.Tk):
                 if transcribe_voices:
                     messagebox.showwarning(
                         APP_TITLE,
-                        "未安装 rust-silk，无法把 SILK 转成 WAV，"
-                        "因此不能继续本地语音转文字。",
+                        tr(
+                            "未安装 rust-silk，无法把 SILK 转成 WAV，"
+                            "因此不能继续本地语音转文字。"
+                        ),
                     )
                     return False
 
@@ -360,25 +399,30 @@ class App(tk.Tk):
                 if reason.startswith("本地语音识别运行库不可用"):
                     messagebox.showerror(
                         APP_TITLE,
-                        "当前程序缺少本地语音识别运行库。\n\n"
-                        "如果你使用的是 GitHub 发布的 Windows 版，请重新下载最新构建；"
-                        "如果从源码运行，请先安装 requirements.txt。\n\n"
-                        f"详细信息：{reason}",
+                        tr(
+                            "当前程序缺少本地语音识别运行库。\n\n"
+                            "如果你使用的是 GitHub 发布的 Windows 版，请重新下载最新构建；"
+                            "如果从源码运行，请先安装 requirements.txt。\n\n"
+                            "详细信息：{reason}",
+                            reason=reason,
+                        ),
                     )
                     return False
 
                 install_now = messagebox.askyesno(
                     APP_TITLE,
-                    "本地语音识别模型还没有安装。\n\n"
-                    "需要从 sherpa-onnx 官方 GitHub Release 下载约 230 MB 的 "
-                    "SenseVoice Small Int8 模型。\n"
-                    "模型只下载一次，之后识别在本机完成，不上传聊天语音。\n\n"
-                    "现在下载并安装吗？",
+                    tr(
+                        "本地语音识别模型还没有安装。\n\n"
+                        "需要从 sherpa-onnx 官方 GitHub Release 下载约 230 MB 的 "
+                        "SenseVoice Small Int8 模型。\n"
+                        "模型只下载一次，之后识别在本机完成，不上传聊天语音。\n\n"
+                        "现在下载并安装吗？"
+                    ),
                 )
                 if install_now:
                     self._set_export_buttons("disabled")
                     self.log("")
-                    self.log("开始安装本地语音识别模型…")
+                    self.log(tr("开始安装本地语音识别模型…"))
                     threading.Thread(
                         target=self.install_asr_worker,
                         daemon=True,
@@ -398,7 +442,7 @@ class App(tk.Tk):
     def start_export(self):
         name = self.name_var.get().strip()
         if not name:
-            messagebox.showwarning(APP_TITLE, "请输入好友备注名、昵称或群名。")
+            messagebox.showwarning(APP_TITLE, tr("请输入好友备注名、昵称或群名。"))
             return
 
         if not is_wechat_running():
@@ -414,7 +458,7 @@ class App(tk.Tk):
             return
 
         self._begin_export()
-        self.log(f"开始导出：{name}")
+        self.log(tr("开始导出：{name}", name=name))
 
         thread = threading.Thread(
             target=self.worker,
@@ -439,13 +483,15 @@ class App(tk.Tk):
 
         if not messagebox.askyesno(
             APP_TITLE,
-            "将导出本机所有能够从本地消息表可靠识别的私聊和群聊。\n\n"
-            "· 只处理实际存在本地消息表的会话，不把‘只加过好友’当成聊天；\n"
-            "· 无法可靠反查 username 的消息表会跳过，不会猜测身份；\n"
-            "· 每个会话使用由稳定 username 派生的固定目录，避免同名联系人串目录；\n"
-            "· 勾选图片、文件、语音或视频时可能占用大量磁盘空间；\n"
-            "· 如需先小范围试跑，可用命令行 --all --limit 20。\n\n"
-            "确定开始吗？",
+            tr(
+                "将导出本机所有能够从本地消息表可靠识别的私聊和群聊。\n\n"
+                "· 只处理实际存在本地消息表的会话，不把‘只加过好友’当成聊天；\n"
+                "· 无法可靠反查 username 的消息表会跳过，不会猜测身份；\n"
+                "· 每个会话使用由稳定 username 派生的固定目录，避免同名联系人串目录；\n"
+                "· 勾选图片、文件、语音或视频时可能占用大量磁盘空间；\n"
+                "· 如需先小范围试跑，可用命令行 --all --limit 20。\n\n"
+                "确定开始吗？"
+            ),
         ):
             return
 
@@ -458,7 +504,7 @@ class App(tk.Tk):
             return
 
         self._begin_export()
-        self.log("开始导出全部聊天…")
+        self.log(tr("开始导出全部聊天…"))
         thread = threading.Thread(
             target=self.worker_all,
             args=(
@@ -553,7 +599,7 @@ class App(tk.Tk):
                 elif kind == "done":
                     self.last_output = payload["output_dir"]
                     self.last_result = payload
-                    self.log(f"输出：{payload['output_dir']}")
+                    self.log(tr("输出：{path}", path=payload['output_dir']))
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
                     self.clear_cache_btn.configure(state="normal")
@@ -561,20 +607,26 @@ class App(tk.Tk):
                     self.preview_btn.configure(state="normal")
 
                     stats = payload.get("media_stats") or {}
-                    media_line = (
-                        f"\n图片：{stats.get('images_exported', 0)}/"
-                        f"{stats.get('images_requested', 0)}"
-                        f"\n文件：{stats.get('files_exported', 0)}/"
-                        f"{stats.get('files_requested', 0)}"
-                        f"\n语音：{stats.get('voices_exported', 0)}/"
-                        f"{stats.get('voices_requested', 0)}"
-                        f"（WAV {stats.get('voices_decoded', 0)}）"
-                        f"\n语音转文字：{stats.get('voice_transcripts', 0)}/"
-                        f"{stats.get('voices_requested', 0)}"
-                        f"（本地 {stats.get('voice_transcripts_local', 0)}，"
-                        f"缓存 {stats.get('voice_transcripts_cached', 0)}）"
-                        f"\n视频：{stats.get('videos_exported', 0)}/"
-                        f"{stats.get('videos_requested', 0)}"
+                    media_line = tr(
+                        "\n图片：{images_exported}/{images_requested}"
+                        "\n文件：{files_exported}/{files_requested}"
+                        "\n语音：{voices_exported}/{voices_requested}"
+                        "（WAV {voices_decoded}）"
+                        "\n语音转文字：{voice_transcripts}/{voices_requested}"
+                        "（本地 {voice_transcripts_local}，缓存 {voice_transcripts_cached}）"
+                        "\n视频：{videos_exported}/{videos_requested}",
+                        images_exported=stats.get('images_exported', 0),
+                        images_requested=stats.get('images_requested', 0),
+                        files_exported=stats.get('files_exported', 0),
+                        files_requested=stats.get('files_requested', 0),
+                        voices_exported=stats.get('voices_exported', 0),
+                        voices_requested=stats.get('voices_requested', 0),
+                        voices_decoded=stats.get('voices_decoded', 0),
+                        voice_transcripts=stats.get('voice_transcripts', 0),
+                        voice_transcripts_local=stats.get('voice_transcripts_local', 0),
+                        voice_transcripts_cached=stats.get('voice_transcripts_cached', 0),
+                        videos_exported=stats.get('videos_exported', 0),
+                        videos_requested=stats.get('videos_requested', 0),
                     )
 
                     cleanup_ok = payload.get("sensitive_cache_cleanup", True)
@@ -582,10 +634,9 @@ class App(tk.Tk):
                     cleanup_note = (
                         ""
                         if cleanup_ok
-                        else (
-                            "\n\n⚠ 敏感临时缓存自动清理失败。"
-                            "\n请点击“清除敏感缓存”重试。"
-                            + (f"\n详细信息：{cleanup_error}" if cleanup_error else "")
+                        else tr(
+                            "⚠ 敏感临时缓存自动清理失败。\n请点击“清除敏感缓存”重试。\n详细信息：{error}",
+                            error=cleanup_error or "",
                         )
                     )
                     show_result = (
@@ -595,18 +646,25 @@ class App(tk.Tk):
                     )
                     show_result(
                         APP_TITLE,
-                        f"导出完成。\n\n"
-                        f"类型：{'群聊' if payload['is_group'] else '私聊'}\n"
-                        f"消息数：{payload['message_count']}\n"
-                        f"会话：{payload['chat_name']}"
-                        f"{media_line}\n\n"
-                        "已生成 TXT、Markdown 和 JSON。"
-                        f"{cleanup_note}",
+                        tr(
+                            "导出完成。\n\n"
+                            "类型：{chat_type}\n"
+                            "消息数：{message_count}\n"
+                            "会话：{chat_name}"
+                            "{media_line}\n\n"
+                            "已生成 TXT、Markdown 和 JSON。"
+                            "{cleanup_note}",
+                            chat_type=tr("群聊") if payload['is_group'] else tr("私聊"),
+                            message_count=payload['message_count'],
+                            chat_name=payload['chat_name'],
+                            media_line=media_line,
+                            cleanup_note=cleanup_note,
+                        ),
                     )
                 elif kind == "all_done":
                     self.last_output = payload["output_dir"]
                     self.last_result = None
-                    self.log(f"输出：{payload['output_dir']}")
+                    self.log(tr("输出：{path}", path=payload['output_dir']))
                     self._set_export_buttons("normal")
                     self.clear_cache_btn.configure(state="normal")
                     self.open_btn.configure(state="normal")
@@ -617,15 +675,14 @@ class App(tk.Tk):
                     cleanup_note = (
                         ""
                         if cleanup_ok
-                        else (
-                            "\n\n⚠ 敏感临时缓存自动清理失败。"
-                            "\n请点击‘清除敏感缓存’重试。"
-                            + (f"\n详细信息：{cleanup_error}" if cleanup_error else "")
+                        else tr(
+                            "⚠ 敏感临时缓存自动清理失败。\n请点击‘清除敏感缓存’重试。\n详细信息：{error}",
+                            error=cleanup_error or "",
                         )
                     )
                     unresolved = payload.get("unresolved_message_tables", 0)
                     unresolved_note = (
-                        f"\n无法可靠反查身份、已跳过的消息表：{unresolved}"
+                        tr("\n无法可靠反查身份、已跳过的消息表：{count}", count=unresolved)
                         if unresolved
                         else ""
                     )
@@ -636,16 +693,27 @@ class App(tk.Tk):
                     )
                     show_result(
                         APP_TITLE,
-                        "全部聊天导出完成。\n\n"
-                        f"可可靠识别会话：{payload['discovered_total']}\n"
-                        f"本次处理：{payload['selected_total']}\n"
-                        f"成功：{payload['exported']}\n"
-                        f"无消息：{payload['skipped_empty']}\n"
-                        f"失败：{payload['failed']}\n"
-                        f"消息总数：{payload['total_messages']}"
-                        f"{unresolved_note}\n\n"
-                        f"总索引：\n{payload['index_md']}"
-                        f"{cleanup_note}",
+                        tr(
+                            "全部聊天导出完成。\n\n"
+                            "可可靠识别会话：{discovered_total}\n"
+                            "本次处理：{selected_total}\n"
+                            "成功：{exported}\n"
+                            "无消息：{skipped_empty}\n"
+                            "失败：{failed}\n"
+                            "消息总数：{total_messages}"
+                            "{unresolved_note}\n\n"
+                            "总索引：\n{index_md}"
+                            "{cleanup_note}",
+                            discovered_total=payload['discovered_total'],
+                            selected_total=payload['selected_total'],
+                            exported=payload['exported'],
+                            skipped_empty=payload['skipped_empty'],
+                            failed=payload['failed'],
+                            total_messages=payload['total_messages'],
+                            unresolved_note=unresolved_note,
+                            index_md=payload['index_md'],
+                            cleanup_note=cleanup_note,
+                        ),
                     )
                 elif kind == "cache_cleared":
                     self.export_btn.configure(state="normal")
@@ -655,50 +723,52 @@ class App(tk.Tk):
                     failed = payload.get("failed") or []
                     if removed:
                         for path in removed:
-                            self.log(f"已清除：{path}")
+                            self.log(tr("已清除：{path}", path=path))
                     else:
-                        self.log("没有发现需要清理的敏感缓存。")
+                        self.log(tr("没有发现需要清理的敏感缓存。"))
                     if failed:
                         details = "\n".join(
-                            f"{item.get('path')}：{item.get('error')}"
+                            f"{item.get('path')}: {item.get('error')}"
                             for item in failed
                         )
-                        self.log("部分敏感缓存清理失败。")
+                        self.log(tr("部分敏感缓存清理失败。"))
                         messagebox.showwarning(
                             APP_TITLE,
-                            "部分敏感缓存清理失败。\n\n"
-                            "请确认没有其他程序正在使用这些文件，然后重试。\n\n"
-                            + details,
+                            tr(
+                                "部分敏感缓存清理失败。\n\n"
+                                "请确认没有其他程序正在使用这些文件，然后重试。\n\n"
+                                "{details}",
+                                details=details,
+                            ),
                         )
                     else:
                         messagebox.showinfo(
                             APP_TITLE,
-                            "敏感缓存清理完成。"
+                            tr("敏感缓存清理完成。")
                             if removed
-                            else "没有发现需要清理的敏感缓存。",
+                            else tr("没有发现需要清理的敏感缓存。"),
                         )
                 elif kind == "cache_clear_error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
                     self.clear_cache_btn.configure(state="normal")
-                    self.log("敏感缓存清理失败：" + payload)
+                    self.log(tr("敏感缓存清理失败：{error}", error=payload))
                     messagebox.showerror(
                         APP_TITLE,
-                        "敏感缓存清理失败：\n\n" + payload,
+                        tr("敏感缓存清理失败：{error}", error=payload),
                     )
                 elif kind == "asr_installed":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
-                    self.log("本地语音识别模型安装完成。")
+                    self.log(tr("本地语音识别模型安装完成。"))
                     messagebox.showinfo(
                         APP_TITLE,
-                        "本地语音识别模型安装完成。\n\n"
-                        "现在可以重新开始导出。",
+                        tr("本地语音识别模型安装完成。\n\n现在可以重新开始导出。"),
                     )
                 elif kind == "rust_silk_installed":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
-                    self.log("rust-silk 安装完成，继续导出。")
+                    self.log(tr("rust-silk 安装完成，继续导出。"))
                     resume = (
                         self.start_export_all if self.pending_all
                         else self.start_export
@@ -707,27 +777,27 @@ class App(tk.Tk):
                 elif kind == "rust_silk_error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
-                    self.log("rust-silk 安装失败：" + payload)
+                    self.log(tr("rust-silk 安装失败：{error}", error=payload))
                     messagebox.showerror(
                         APP_TITLE,
-                        "rust-silk 安装失败：\n\n" + payload,
+                        tr("rust-silk 安装失败：{error}", error=payload),
                     )
                 elif kind == "asr_error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
-                    self.log("本地语音识别模型安装失败：" + payload)
+                    self.log(tr("本地语音识别模型安装失败：{error}", error=payload))
                     messagebox.showerror(
                         APP_TITLE,
-                        "本地语音识别模型安装失败：\n\n" + payload,
+                        tr("本地语音识别模型安装失败：{error}", error=payload),
                     )
                 elif kind == "error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
                     self.clear_cache_btn.configure(state="normal")
-                    self.log("导出失败：" + payload)
+                    self.log(tr("导出失败：{error}", error=payload))
                     messagebox.showerror(
                         APP_TITLE,
-                        "导出失败：\n\n" + payload,
+                        tr("导出失败：{error}", error=payload),
                     )
         except queue.Empty:
             pass
@@ -750,7 +820,7 @@ class App(tk.Tk):
 
         folder = filedialog.askdirectory(
             parent=self,
-            title="选择已导出的聊天文件夹",
+            title=tr("选择已导出的聊天文件夹"),
             initialdir=str(initial_dir),
         )
         if not folder:
@@ -760,8 +830,10 @@ class App(tk.Tk):
         if not json_path.is_file():
             messagebox.showwarning(
                 APP_TITLE,
-                "这个文件夹里没有找到 chat_full_parsed.json。\n\n"
-                "请选择一个具体的聊天导出文件夹。",
+                tr(
+                    "这个文件夹里没有找到 chat_full_parsed.json。\n\n"
+                    "请选择一个具体的聊天导出文件夹。"
+                ),
             )
             return
 
