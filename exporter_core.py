@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import gc
 import hashlib
 import html
 import io
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 import unicodedata
 import urllib.request
 import zipfile
@@ -26,6 +28,12 @@ import xml.etree.ElementTree as ET
 import zstandard as zstd
 from wechatauto import MediaDownloader, WeChatDB
 from PIL import Image, ImageStat
+
+from time_ranges import (
+    describe_ranges,
+    filter_rows_by_ranges,
+    parse_time_ranges,
+)
 
 APP_VERSION = "1.4.0"
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
@@ -62,6 +70,14 @@ UPSTREAM_KEYS_ENV = "WECHATAUTO_KEYS_DIR"
 _SENSITIVE_SANDBOX_LOCK = threading.RLock()
 
 
+class AmbiguousContactError(ValueError):
+    """A keyword matches several conversations and cannot be resolved safely."""
+
+    def __init__(self, message, candidates):
+        super().__init__(message)
+        self.candidates = candidates
+
+
 class EmptyConversationError(ValueError):
     """A resolved conversation exists, but no local message rows were found."""
 
@@ -75,14 +91,9 @@ def sensitive_cache_locations() -> dict[str, str]:
     }
 
 
-def _create_sensitive_workdir() -> Path:
-    # 只负责创建本次独立工作目录；失效残留由 export_chat() 在导出前统一清理。
-    root = Path(sensitive_cache_locations()["current"])
-    root.mkdir(parents=True, exist_ok=True)
-    workdir = Path(tempfile.mkdtemp(prefix="run-", dir=root))
-
+def _write_owner_marker(workdir: Path) -> bool:
     # 记录创建该目录的进程，供下次启动判断“是否仍有实例正在使用”。
-    marker = workdir / SENSITIVE_OWNER_MARKER
+    marker = Path(workdir) / SENSITIVE_OWNER_MARKER
     try:
         marker.write_text(
             json.dumps(
@@ -95,9 +106,17 @@ def _create_sensitive_workdir() -> Path:
             encoding="utf-8",
         )
     except OSError:
-        # 标记失败不应阻止导出；这种目录以后按“无标记目录”保守处理。
-        pass
+        return False
+    return True
 
+
+def _create_sensitive_workdir() -> Path:
+    # 只负责创建本次独立工作目录；失效残留由 export_chat() 在导出前统一清理。
+    root = Path(sensitive_cache_locations()["current"])
+    root.mkdir(parents=True, exist_ok=True)
+    workdir = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+    # 标记失败不应阻止导出；这种目录以后按“无标记目录”保守处理。
+    _write_owner_marker(workdir)
     return workdir
 
 
@@ -324,17 +343,38 @@ def clear_current_sensitive_cache():
     return report
 
 
-def _cleanup_sensitive_workdir(workdir: Path, progress=None):
-    # 尽力删除一次性工作目录，不用清理错误覆盖原始导出结果。
-    workdir = Path(workdir)
+CLEANUP_RETRY_DELAY_SECONDS = 0.5
+
+
+def _remove_tree(workdir: Path):
     try:
         shutil.rmtree(workdir)
     except FileNotFoundError:
-        ok, error = True, None
+        return True, None
     except OSError as exc:
-        ok, error = False, f"{type(exc).__name__}: {exc}"
-    else:
-        ok, error = True, None
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, None
+
+
+def _cleanup_sensitive_workdir(workdir: Path, progress=None):
+    # 尽力删除一次性工作目录，不用清理错误覆盖原始导出结果。
+    workdir = Path(workdir)
+
+    # Python 3.11+ 的 sqlite3.Connection 通过 lru_cache 语句缓存引用自身，
+    # 未显式 close() 的连接处在循环引用中，只有循环 GC 才会真正关闭文件句柄。
+    # 上游 WeChatDB.get_self_info()（wechatauto-replica 1.2.4.4）打开 contact.db
+    # 后没有关闭；在 Windows 上，这个仍打开的解密库会让 rmtree 失败，
+    # 导致解密数据库和 keys.json 残留。删除前先回收，失败再回收并重试一次。
+    gc.collect()
+    ok, error = _remove_tree(workdir)
+    if not ok:
+        gc.collect()
+        time.sleep(CLEANUP_RETRY_DELAY_SECONDS)
+        ok, error = _remove_tree(workdir)
+    if not ok and workdir.exists():
+        # rmtree 可能已删掉 owner 标记；补写回去，使本进程退出后
+        # 下一次启动 / 导出能立即自动清理，而不是按“无标记目录”等待 24 小时。
+        _write_owner_marker(workdir)
 
     if ok:
         if progress:
@@ -687,16 +727,86 @@ def parse_content(
         return parse_system_message(text)
     return clean_text(text) if text else f"[消息 type={raw_type}]"
 
-def find_contact(db: WeChatDB, keyword: str):
-    results = db.search_contact(keyword)
+def _contact_label(item) -> str:
+    remark = item.get("remark") or ""
+    nick = item.get("nick_name") or ""
+    username = item.get("username") or ""
+    if remark and nick and remark != nick:
+        shown = f"{remark}（昵称：{nick}）"
+    else:
+        shown = remark or nick or username
+    return f"{shown} [{username}]"
+
+
+def _has_local_chat(db, username, chat_hashes=None) -> bool:
+    if chat_hashes is None:
+        chat_hashes = _batch_message_hashes(db)
+    digest = hashlib.md5(username.encode("utf-8")).hexdigest().casefold()
+    return digest in chat_hashes
+
+
+def find_contact(db: WeChatDB, keyword: str, chat_hashes=None):
+    """按备注 / 昵称 / 微信号解析唯一会话；无法唯一确定时报错而不是猜测。
+
+    上游 search_contact 是对昵称、备注、username、alias 的模糊匹配，并且
+    contact.db 里还包含大量非好友群成员，同名非常常见。规则：
+
+    1. 输入与某个 username 完全相同 → 直接使用；
+    2. 否则按“备注完全相同” → “昵称完全相同” → “模糊匹配”逐级查找，
+       在第一个有结果的层级内决定；
+    3. 同一层级有多个候选时，只保留本机确实有聊天记录的会话
+       （没有聊天记录的对象本来就无法导出，排除它们不是猜测）；
+    4. 仍有多个 → AmbiguousContactError 并列出候选；一个都没有 → ValueError。
+    """
+    keyword = (keyword or "").strip()
+    if not keyword:
+        raise ValueError("请输入好友备注名、昵称或群名。")
+
+    seen = set()
+    results = []
+    for item in db.search_contact(keyword) or []:
+        username = _identity_username(item.get("username"))
+        if username is None or username in seen:
+            continue
+        seen.add(username)
+        results.append({**item, "username": username})
     if not results:
         raise ValueError(f"没有找到联系人或群聊：{keyword}")
 
-    exact = [
-        x for x in results
-        if x.get("remark") == keyword or x.get("nick_name") == keyword
-    ]
-    return exact[0] if exact else results[0]
+    by_username = [x for x in results if x["username"] == keyword]
+    if by_username:
+        return by_username[0]
+
+    tiers = (
+        ("备注完全相同", [x for x in results if (x.get("remark") or "") == keyword]),
+        ("昵称完全相同", [x for x in results if (x.get("nick_name") or "") == keyword]),
+        ("模糊匹配", results),
+    )
+    tier_name, candidates = next((name, items) for name, items in tiers if items)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    hashes = chat_hashes if chat_hashes is not None else _batch_message_hashes(db)
+    with_chats = [x for x in candidates if _has_local_chat(db, x["username"], hashes)]
+    if len(with_chats) == 1:
+        return with_chats[0]
+    if not with_chats:
+        raise ValueError(
+            f"“{keyword}”{tier_name}的 {len(candidates)} 个对象在本机都没有聊天记录："
+            + "、".join(_contact_label(x) for x in candidates[:5])
+            + ("……" if len(candidates) > 5 else "")
+        )
+
+    shown = with_chats[:10]
+    lines = "\n".join(f"  - {_contact_label(x)}" for x in shown)
+    more = f"\n  ……另有 {len(with_chats) - len(shown)} 个" if len(with_chats) > len(shown) else ""
+    raise AmbiguousContactError(
+        f"“{keyword}”{tier_name}的有 {len(with_chats)} 个有聊天记录的会话，无法确定是哪一个，"
+        f"为避免导出错人已停止：\n{lines}{more}\n"
+        "请输入更完整的备注名，或改用方括号里的 username，"
+        "或使用“多选导出”从列表中勾选。",
+        with_chats,
+    )
 
 
 def table_columns(conn, table: str) -> set[str]:
@@ -2451,16 +2561,30 @@ def _relativize_media(chat_dir: Path, media: dict):
     return media
 
 
-def _write_txt(parsed: list[dict], path: Path, is_group: bool, target_name: str):
+def _write_txt(parsed: list[dict], path: Path, is_group: bool, target_name: str, time_ranges=None):
     with path.open("w", encoding="utf-8-sig", newline="\n") as f:
         f.write(f"WeChat Chat Export for LLM v{APP_VERSION}\n")
         f.write(f"会话类型：{'群聊' if is_group else '私聊'}\n")
         f.write(f"会话名称：{target_name}\n")
+        if time_ranges:
+            f.write(f"导出时间段（{len(time_ranges)} 段，仅包含这些时间内的消息）：\n")
+            for index, item in enumerate(time_ranges, 1):
+                f.write(f"  {index}. {item.label}\n")
         f.write(f"消息总数：{len(parsed)}\n")
         f.write("=" * 70 + "\n\n")
         last_date = None
+        last_range = None
+        show_ranges = bool(time_ranges) and len(time_ranges) > 1
         for m in parsed:
             date = m["time"][:10] if len(m["time"]) >= 10 else ""
+            range_index = m.get("range_index")
+            if show_ranges and range_index and range_index != last_range:
+                if last_range is not None:
+                    f.write("\n…… 中间时段的消息未导出 ……\n\n")
+                label = time_ranges[range_index - 1].label
+                f.write(f"########## 时间段 {range_index}/{len(time_ranges)}：{label} ##########\n\n")
+                last_range = range_index
+                last_date = None
             if date and date != last_date:
                 if last_date is not None:
                     f.write("\n")
@@ -2481,16 +2605,30 @@ def _md_message_content(content: str) -> str:
     return (content or "").replace("\n", "  \n")
 
 
-def _write_markdown(parsed: list[dict], path: Path, is_group: bool, target_name: str):
+def _write_markdown(parsed: list[dict], path: Path, is_group: bool, target_name: str, time_ranges=None):
     with path.open("w", encoding="utf-8", newline="\n") as f:
         f.write(f"# {target_name}\n\n")
         f.write(f"- 导出器：WeChat Chat Export for LLM v{APP_VERSION}\n")
         f.write(f"- 会话类型：{'群聊' if is_group else '私聊'}\n")
+        if time_ranges:
+            f.write(f"- 导出时间段（{len(time_ranges)} 段，仅包含这些时间内的消息）：\n")
+            for index, item in enumerate(time_ranges, 1):
+                f.write(f"  {index}. {item.label}\n")
         f.write(f"- 消息总数：{len(parsed)}\n\n")
         last_date = None
+        last_range = None
+        show_ranges = bool(time_ranges) and len(time_ranges) > 1
         for m in parsed:
             date = m["time"][:10] if len(m["time"]) >= 10 else ""
             time_only = m["time"][11:19] if len(m["time"]) >= 19 else m["time"]
+            range_index = m.get("range_index")
+            if show_ranges and range_index and range_index != last_range:
+                if last_range is not None:
+                    f.write("\n*…… 中间时段的消息未导出 ……*\n")
+                label = time_ranges[range_index - 1].label
+                f.write(f"\n---\n\n**时间段 {range_index}/{len(time_ranges)}：{label}**\n")
+                last_range = range_index
+                last_date = None
             if date and date != last_date:
                 f.write(f"\n## {date}\n\n")
                 last_date = date
@@ -2539,6 +2677,7 @@ def _export_chat_impl(
     contact=None,
     folder_name=None,
     index_cache=None,
+    time_ranges=None,
 ):
     def log(msg):
         if progress:
@@ -2570,6 +2709,24 @@ def _export_chat_impl(
     rows = load_rows(db, username)
     if not rows:
         raise EmptyConversationError("没有读取到该会话的消息。")
+
+    time_ranges = list(time_ranges or [])
+    if time_ranges:
+        total_rows = len(rows)
+        rows, unknown_time = filter_rows_by_ranges(
+            rows, time_ranges,
+            lambda r: _normalize_timestamp(r.get("create_time")),
+        )
+        log(
+            f"按 {len(time_ranges)} 个时间段筛选：保留 {len(rows)}/{total_rows} 条消息。"
+        )
+        if unknown_time:
+            log(f"另有 {unknown_time} 条消息缺少有效时间，无法判断是否在时间段内，未导出。")
+        if not rows:
+            raise EmptyConversationError(
+                f"该会话在所选时间段（{describe_ranges(time_ranges)}）内没有消息"
+                f"（共 {total_rows} 条消息都不在范围内或缺少有效时间）。"
+            )
 
     out_root = Path(out_root)
     chat_dir = out_root / safe_folder_name(folder_name or target_name)
@@ -2615,6 +2772,7 @@ def _export_chat_impl(
             "transcript_source": "wechat" if transcript else None,
             "media": None,
             "finder_feed": finder_feed,
+            **({"range_index": row.get("_range_index")} if time_ranges else {}),
         })
         if progress and idx % 2000 == 0:
             log(f"已处理 {idx}/{len(rows)} 条消息…")
@@ -2883,13 +3041,14 @@ def _export_chat_impl(
     txt_path = chat_dir / "chat_full_for_llm.txt"
     md_path = chat_dir / "chat_full_for_llm.md"
     json_path = chat_dir / "chat_full_parsed.json"
-    _write_txt(parsed, txt_path, is_group, target_name)
-    _write_markdown(parsed, md_path, is_group, target_name)
+    _write_txt(parsed, txt_path, is_group, target_name, time_ranges=time_ranges)
+    _write_markdown(parsed, md_path, is_group, target_name, time_ranges=time_ranges)
     with json_path.open("w", encoding="utf-8-sig") as f:
         json.dump({
             "exporter_version": APP_VERSION,
             "chat_type": "group" if is_group else "private",
             "chat_name": target_name,
+            "time_ranges": [r.to_dict() for r in time_ranges] or None,
             "message_count": len(parsed),
             "type_counts": type_counts,
             "sender_resolution_counts": dict(sender_counts),
@@ -2932,6 +3091,7 @@ def _export_chat_impl(
     return {
         "chat_name": target_name,
         "is_group": is_group,
+        "time_ranges": [r.to_dict() for r in time_ranges] or None,
         "message_count": len(parsed),
         "sender_resolution_counts": dict(sender_counts),
         "media_stats": media_stats,
@@ -3121,8 +3281,10 @@ def _batch_time_text(value) -> str:
 
 def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
     out_root = Path(out_root)
-    json_path = out_root / "all_chats_index.json"
-    md_path = out_root / "all_chats_index.md"
+    selected = meta.get("selection") == "selected"
+    stem = "selected_chats_index" if selected else "all_chats_index"
+    json_path = out_root / f"{stem}.json"
+    md_path = out_root / f"{stem}.md"
 
     with json_path.open("w", encoding="utf-8-sig") as f:
         json.dump(
@@ -3133,7 +3295,7 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
         )
 
     lines = [
-        "# 全部聊天导出索引",
+        "# 选中聊天导出索引" if selected else "# 全部聊天导出索引",
         "",
         f"- 导出器版本：{APP_VERSION}",
         f"- 生成时间：{meta['generated_at']}",
@@ -3147,6 +3309,18 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
     if meta.get("limited"):
         lines.extend([
             f"- 本次使用 `--limit`，仅处理最近的 {meta['selected_total']} 个会话。",
+            "",
+        ])
+    if meta.get("not_found"):
+        lines.append(f"- 选中但无法导出的会话：{len(meta['not_found'])}")
+        for item in meta["not_found"]:
+            query = str(item.get("query") or "").replace("|", "\\|")
+            lines.append(f"  - {query}：{item.get('reason') or '未找到'}")
+        lines.append("")
+    if meta.get("time_ranges"):
+        labels = "；".join(item["label"] for item in meta["time_ranges"])
+        lines.extend([
+            f"- 导出时间段：{labels}；这些时间内没有消息的会话记为“无消息”。",
             "",
         ])
     lines.extend([
@@ -3176,6 +3350,105 @@ def _write_all_chats_index(out_root: Path, chats: list[dict], meta: dict):
     return json_path, md_path
 
 
+def _select_chats(db, chats, usernames, keywords, log):
+    """从可识别会话中挑出选中的会话，保持选择顺序并去重。
+
+    返回 (选中的会话, 无法导出的选择及原因)。不会为找不到的选择猜测身份。
+    """
+    by_username = {item["username"]: item for item in chats}
+    picked = []
+    seen = set()
+    not_found = []
+
+    def take(username, query):
+        if username in seen:
+            return
+        if username not in by_username:
+            not_found.append({
+                "query": query,
+                "reason": "本机没有该会话的本地消息，或无法可靠识别身份",
+            })
+            return
+        seen.add(username)
+        picked.append(by_username[username])
+
+    for raw in usernames:
+        username = _identity_username(raw)
+        if username is None:
+            not_found.append({"query": str(raw), "reason": "username 无效"})
+            continue
+        take(username, username)
+
+    chat_hashes = _batch_message_hashes(db) if keywords else None
+    for keyword in keywords:
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            continue
+        try:
+            target = find_contact(db, keyword, chat_hashes=chat_hashes)
+        except ValueError as exc:
+            not_found.append({"query": keyword, "reason": str(exc)})
+            continue
+        username = _identity_username(target.get("username"))
+        if username is None:
+            not_found.append({"query": keyword, "reason": "匹配到的联系人 username 无效"})
+            continue
+        shown = target.get("remark") or target.get("nick_name") or username
+        if shown != keyword:
+            log(f"“{keyword}”匹配到：{shown}")
+        take(username, keyword)
+
+    for item in not_found:
+        log(f"选中的会话无法导出：{item['query']}（{item['reason']}）")
+    return picked, not_found
+
+
+def list_chats(db_dir=None, progress=None):
+    """列出本机可可靠识别、可导出的私聊和群聊（供 GUI 多选）。
+
+    与批量导出使用同一套识别规则；同样在一次性敏感工作目录中运行，结束后清理。
+    返回 {"chats": [...], "unresolved_message_tables": n}，会话按最近消息时间排序。
+    """
+    def log(message):
+        if progress:
+            progress(message)
+
+    stale_report = clear_current_sensitive_cache()
+    if stale_report.get("removed"):
+        log(f"已自动清理 {len(stale_report['removed'])} 个上次异常退出留下的敏感临时目录。")
+
+    workdir = _create_sensitive_workdir()
+    log("敏感数据库密钥和解密缓存将使用一次性临时目录，读取结束后自动清理。")
+    try:
+        with _upstream_sensitive_sandbox(workdir):
+            resolved = resolve_db_dir(db_dir) if db_dir else None
+            log("正在读取本机聊天列表…")
+            db = WeChatDB(db_dir=resolved, workdir=str(workdir))
+            chats, unresolved = _batch_chat_candidates(db, progress=progress)
+    except BaseException:
+        _cleanup_sensitive_workdir(workdir, progress=progress)
+        raise
+    cleanup_ok, cleanup_error = _cleanup_sensitive_workdir(workdir, progress=progress)
+
+    items = [
+        {
+            "username": item["username"],
+            "name": item["name"],
+            "is_group": bool(item["is_group"]),
+            "last_time": item.get("last_time"),
+            "last_time_text": _batch_time_text(item.get("last_time")),
+        }
+        for item in chats
+    ]
+    log(f"共找到 {len(items)} 个可导出的会话。")
+    return {
+        "chats": items,
+        "unresolved_message_tables": unresolved,
+        "sensitive_cache_cleanup": cleanup_ok,
+        "sensitive_cache_cleanup_error": cleanup_error,
+    }
+
+
 def _export_all_chats_impl(
     out_root="exports",
     progress=None,
@@ -3187,13 +3460,23 @@ def _export_all_chats_impl(
     db_dir=None,
     workdir=None,
     limit=None,
+    time_ranges=None,
+    usernames=None,
+    keywords=None,
 ):
+    """usernames / keywords 为 None 时导出全部；否则只导出选中的会话。
+
+    usernames 来自 list_chats() 的稳定 username（GUI 多选）；keywords 是备注、
+    昵称或群名（命令行），按单会话导出相同的规则解析。两者可同时使用。
+    """
     def log(message):
         if progress:
             progress(message)
 
     if transcribe_voices:
         export_voices = True
+    time_ranges = list(time_ranges or [])
+    selecting = usernames is not None or keywords is not None
 
     if db_dir:
         db_dir = resolve_db_dir(db_dir)
@@ -3215,11 +3498,24 @@ def _export_all_chats_impl(
         )
 
     discovered_total = len(chats)
+    not_found = []
+    if selecting:
+        chats, not_found = _select_chats(
+            db, chats, usernames or [], keywords or [], log
+        )
+        if not chats:
+            details = "；".join(
+                f"{item['query']}（{item['reason']}）" for item in not_found
+            )
+            raise ValueError("选中的会话都无法导出：" + (details or "没有选择任何会话"))
+    pool_total = len(chats)
     if limit is not None:
         chats = chats[:limit]
-    limited = len(chats) < discovered_total
+    limited = len(chats) < pool_total
 
-    if limited:
+    if selecting:
+        log(f"本次导出选中的 {len(chats)} 个会话。")
+    elif limited:
         log(f"已按数量上限只处理最近的 {len(chats)} 个会话。")
     else:
         log(f"共发现 {discovered_total} 个可可靠识别的本地会话。")
@@ -3266,12 +3562,16 @@ def _export_all_chats_impl(
                 contact=contact,
                 folder_name=folder,
                 index_cache=index_cache,
+                time_ranges=time_ranges,
             )
         except EmptyConversationError as exc:
             entry["status"] = "skipped_empty"
             entry["error"] = str(exc)
             skipped_empty += 1
-            log(f"该会话没有可读取的本地消息，已跳过：{name}")
+            if time_ranges:
+                log(f"该会话在所选时间段内没有消息，已跳过：{name}")
+            else:
+                log(f"该会话没有可读取的本地消息，已跳过：{name}")
         except Exception as exc:
             entry["status"] = "failed"
             entry["error"] = f"{type(exc).__name__}: {exc}"
@@ -3299,6 +3599,9 @@ def _export_all_chats_impl(
         "unresolved_message_tables": unresolved,
         "selected_total": len(chats),
         "limited": limited,
+        "selection": "selected" if selecting else "all",
+        "not_found": not_found,
+        "time_ranges": [r.to_dict() for r in time_ranges] or None,
         "exported": exported,
         "skipped_empty": skipped_empty,
         "failed": failed,
@@ -3314,6 +3617,8 @@ def _export_all_chats_impl(
         f"全部完成：成功 {exported}、无消息 {skipped_empty}、失败 {failed}；"
         f"共 {total_messages} 条消息。"
     )
+    if not_found:
+        log(f"另有 {len(not_found)} 个选中的会话无法导出，原因见总索引。")
     log(f"总索引：{index_md}")
 
     return {
@@ -3335,8 +3640,26 @@ def export_all_chats(
     transcribe_voices=False,
     db_dir=None,
     limit=None,
+    time_ranges=None,
+    usernames=None,
+    keywords=None,
 ):
-    """Export all reliably identified local private/group conversations."""
+    """Export all reliably identified local private/group conversations.
+
+    传入 usernames 和/或 keywords 时只导出选中的会话（多选导出），
+    输出结构与批量导出相同，总索引为 selected_chats_index.md / .json。
+
+    time_ranges: 可选时间段（多行文本、字符串列表或 TimeRange 列表，写法见
+    time_ranges.py），只导出落在任一时间段内的消息和附件。
+    """
+    time_ranges = parse_time_ranges(time_ranges)
+    if usernames is not None:
+        usernames = [u for u in usernames if str(u or "").strip()]
+    if keywords is not None:
+        keywords = [k for k in keywords if str(k or "").strip()]
+    if usernames is not None or keywords is not None:
+        if not (usernames or keywords):
+            raise ValueError("请至少选择一个要导出的会话。")
     if limit is not None:
         try:
             limit = int(limit)
@@ -3369,6 +3692,9 @@ def export_all_chats(
                 db_dir=db_dir,
                 workdir=str(workdir),
                 limit=limit,
+                time_ranges=time_ranges,
+                usernames=usernames,
+                keywords=keywords,
             )
     except BaseException:
         _cleanup_sensitive_workdir(workdir, progress=progress)
@@ -3383,6 +3709,16 @@ def export_all_chats(
     return result
 
 
+def export_selected_chats(usernames=None, keywords=None, out_root="exports", **kwargs):
+    """多选导出：只导出 usernames（稳定 username）和/或 keywords（备注/昵称/群名）。"""
+    return export_all_chats(
+        out_root,
+        usernames=list(usernames or []),
+        keywords=list(keywords or []),
+        **kwargs,
+    )
+
+
 def export_chat(
     keyword: str,
     out_root="exports",
@@ -3393,7 +3729,12 @@ def export_chat(
     export_videos=False,
     transcribe_voices=False,
     db_dir=None,
+    time_ranges=None,
 ):
+    # time_ranges: 可选时间段（写法见 time_ranges.py），只导出落在任一时间段内的
+    # 消息和附件。先校验格式，避免连接数据库后才报错。
+    time_ranges = parse_time_ranges(time_ranges)
+
     # 导出前顺便清理本项目上次异常退出留下、且已确认失效的工作目录。
     stale_report = clear_current_sensitive_cache()
     if progress and stale_report.get("removed"):
@@ -3422,6 +3763,7 @@ def export_chat(
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
                 workdir=str(workdir),
+                time_ranges=time_ranges,
             )
     except BaseException:
         # KeyboardInterrupt / SystemExit 也先尽力删除本次敏感工作目录，再原样抛出。

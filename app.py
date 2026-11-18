@@ -19,9 +19,12 @@ from exporter_core import (
     export_chat,
     install_local_asr_model,
     install_rust_silk,
+    list_chats,
     local_asr_status,
     rust_silk_status,
 )
+from time_ranges import parse_time_ranges
+from chat_picker import ChatPicker
 from preview import open_chat_preview
 from wechat_data_dirs import choose_wechat_data_dir
 
@@ -55,8 +58,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("920x730")
-        self.minsize(820, 630)
+        self.geometry("980x840")
+        self.minsize(900, 740)
 
         try:
             icon_bytes = base64.b64decode(WINDOW_ICON_PNG_BASE64)
@@ -69,6 +72,9 @@ class App(tk.Tk):
         self.last_output = None
         self.last_result = None
         self.pending_all = False
+        self.pending_selection = None
+        self._chat_list = None  # {"db_dir": ..., "chats": [...]}，本次运行内复用
+        self._picker = None
 
         pad = ttk.Frame(self, padding=18)
         pad.grid(row=0, column=0, sticky="nsew")
@@ -76,7 +82,7 @@ class App(tk.Tk):
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
         pad.grid_columnconfigure(0, weight=1)
-        pad.grid_rowconfigure(9, weight=1)
+        pad.grid_rowconfigure(10, weight=1)
 
         ttk.Label(
             pad,
@@ -109,12 +115,19 @@ class App(tk.Tk):
         self.export_btn = ttk.Button(row, text="开始导出", command=self.start_export)
         self.export_btn.grid(row=0, column=2)
 
+        self.multi_btn = ttk.Button(
+            row,
+            text="多选导出…",
+            command=self.start_multi_select,
+        )
+        self.multi_btn.grid(row=0, column=3, padx=(8, 0))
+
         self.export_all_btn = ttk.Button(
             row,
             text="导出全部聊天",
             command=self.start_export_all,
         )
-        self.export_all_btn.grid(row=0, column=3, padx=(8, 0))
+        self.export_all_btn.grid(row=0, column=4, padx=(8, 0))
 
         outrow = ttk.Frame(pad)
         outrow.grid(row=4, column=0, sticky="ew", pady=(12, 8))
@@ -179,7 +192,35 @@ class App(tk.Tk):
             text="仅导出本机仍有缓存的附件；“语音转文字（本地）”默认关闭，勾选后会自动同时导出语音。",
         ).grid(row=7, column=0, sticky="w", pady=(2, 4))
 
-        ttk.Separator(pad).grid(row=8, column=0, sticky="ew", pady=10)
+        range_row = ttk.Frame(pad)
+        range_row.grid(row=8, column=0, sticky="ew", pady=(6, 2))
+        ttk.Label(range_row, text="导出时间段：").grid(row=0, column=0, sticky="nw")
+
+        range_row.grid_columnconfigure(1, weight=1)
+
+        range_box = ttk.Frame(range_row)
+        range_box.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        range_box.grid_columnconfigure(0, weight=1)
+        self.ranges_text = tk.Text(range_box, height=4, wrap="none", undo=True)
+        range_scroll = ttk.Scrollbar(
+            range_box, orient="vertical", command=self.ranges_text.yview
+        )
+        self.ranges_text.configure(yscrollcommand=range_scroll.set)
+        self.ranges_text.grid(row=0, column=0, sticky="ew")
+        range_scroll.grid(row=0, column=1, sticky="ns")
+
+        ttk.Label(
+            range_row,
+            text=(
+                "留空导出全部；每行一个时间段，只导出落在其中的消息和附件，重叠的会自动合并。\n"
+                "写法：2025-03-01（全天） · 2025-03-01 ~ 2025-03-05 · 2025-03-01 14:00 ~ 16:30\n"
+                "　　　2025-03-01 ~（该天及之后） · ~ 2025-03-05（该天及之前）"
+            ),
+            foreground="#6b7280",
+            justify="left",
+        ).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(2, 0))
+
+        ttk.Separator(pad).grid(row=9, column=0, sticky="ew", pady=10)
 
         self.status = tk.Text(
             pad,
@@ -187,10 +228,10 @@ class App(tk.Tk):
             wrap="word",
             state="disabled",
         )
-        self.status.grid(row=9, column=0, sticky="nsew")
+        self.status.grid(row=10, column=0, sticky="nsew")
 
         bottom = ttk.Frame(pad)
-        bottom.grid(row=10, column=0, sticky="ew", pady=(10, 0))
+        bottom.grid(row=11, column=0, sticky="ew", pady=(10, 0))
         bottom.grid_columnconfigure(0, weight=1)
 
         self.clear_cache_btn = ttk.Button(
@@ -264,6 +305,7 @@ class App(tk.Tk):
 
         self.export_btn.configure(state="disabled")
         self.export_all_btn.configure(state="disabled")
+        self.multi_btn.configure(state="disabled")
         self.clear_cache_btn.configure(state="disabled")
         self.log("")
         self.log("正在清除敏感临时缓存…")
@@ -315,6 +357,7 @@ class App(tk.Tk):
     def _set_export_buttons(self, state):
         self.export_btn.configure(state=state)
         self.export_all_btn.configure(state=state)
+        self.multi_btn.configure(state=state)
 
     def _warn_wechat_not_running(self):
         self.log("未检测到正在运行的 Windows 微信。")
@@ -395,10 +438,30 @@ class App(tk.Tk):
         self.last_result = None
         self.log("")
 
+    def _read_time_ranges(self):
+        """返回 (是否有效, 合并后的时间段列表)。格式错误时弹窗列出出错的行。"""
+        text = self.ranges_text.get("1.0", "end")
+        try:
+            return True, parse_time_ranges(text)
+        except ValueError as exc:
+            messagebox.showwarning(APP_TITLE, str(exc))
+            return False, []
+
+    def _log_time_ranges(self, ranges):
+        if not ranges:
+            return
+        self.log(f"导出时间段（合并后共 {len(ranges)} 段）：")
+        for index, item in enumerate(ranges, 1):
+            self.log(f"  {index}. {item.label}")
+
     def start_export(self):
         name = self.name_var.get().strip()
         if not name:
             messagebox.showwarning(APP_TITLE, "请输入好友备注名、昵称或群名。")
+            return
+
+        ranges_ok, ranges = self._read_time_ranges()
+        if not ranges_ok:
             return
 
         if not is_wechat_running():
@@ -410,11 +473,13 @@ class App(tk.Tk):
             self.voices_var.set(True)
 
         self.pending_all = False
+        self.pending_selection = None
         if not self._check_media_ready(transcribe_voices):
             return
 
         self._begin_export()
         self.log(f"开始导出：{name}")
+        self._log_time_ranges(ranges)
 
         thread = threading.Thread(
             target=self.worker,
@@ -427,19 +492,30 @@ class App(tk.Tk):
                 self.videos_var.get(),
                 transcribe_voices,
                 self.db_dir_var.get().strip() or None,
+                ranges,
             ),
             daemon=True,
         )
         thread.start()
 
     def start_export_all(self):
+        ranges_ok, ranges = self._read_time_ranges()
+        if not ranges_ok:
+            return
+
         if not is_wechat_running():
             self._warn_wechat_not_running()
             return
 
+        since_note = (
+            f"· 只导出所填 {len(ranges)} 个时间段内的消息；这些时间内没有消息的会话会记为“无消息”；\n"
+            if ranges
+            else ""
+        )
         if not messagebox.askyesno(
             APP_TITLE,
             "将导出本机所有能够从本地消息表可靠识别的私聊和群聊。\n\n"
+            + since_note +
             "· 只处理实际存在本地消息表的会话，不把‘只加过好友’当成聊天；\n"
             "· 无法可靠反查 username 的消息表会跳过，不会猜测身份；\n"
             "· 每个会话使用由稳定 username 派生的固定目录，避免同名联系人串目录；\n"
@@ -454,11 +530,13 @@ class App(tk.Tk):
             self.voices_var.set(True)
 
         self.pending_all = True
+        self.pending_selection = None
         if not self._check_media_ready(transcribe_voices):
             return
 
         self._begin_export()
         self.log("开始导出全部聊天…")
+        self._log_time_ranges(ranges)
         thread = threading.Thread(
             target=self.worker_all,
             args=(
@@ -469,10 +547,122 @@ class App(tk.Tk):
                 self.videos_var.get(),
                 transcribe_voices,
                 self.db_dir_var.get().strip() or None,
+                ranges,
             ),
             daemon=True,
         )
         thread.start()
+
+    # ---- 多选导出 ----
+    def start_multi_select(self):
+        if self._picker is not None and self._picker.winfo_exists():
+            self._picker.lift()
+            self._picker.focus_set()
+            return
+        if not is_wechat_running():
+            self._warn_wechat_not_running()
+            return
+        db_dir = self.db_dir_var.get().strip() or None
+        if self._chat_list and self._chat_list["db_dir"] == db_dir:
+            self._open_picker(self._chat_list["chats"])
+            return
+        self._load_chat_list(db_dir, keep=None)
+
+    def _load_chat_list(self, db_dir, keep):
+        self._set_export_buttons("disabled")
+        self.clear_cache_btn.configure(state="disabled")
+        self.log("")
+        threading.Thread(
+            target=self._list_chats_worker, args=(db_dir, keep), daemon=True
+        ).start()
+
+    def _list_chats_worker(self, db_dir, keep):
+        try:
+            result = list_chats(
+                db_dir=db_dir, progress=lambda m: self.q.put(("log", m))
+            )
+            self.q.put(("chats_listed", (db_dir, result, keep)))
+        except Exception as exc:
+            self.q.put(("chats_list_error", f"{type(exc).__name__}: {exc}"))
+
+    def _open_picker(self, chats, keep=None):
+        if not chats:
+            messagebox.showinfo(APP_TITLE, "没有找到可导出的私聊或群聊。")
+            return
+        self._picker = ChatPicker(
+            self,
+            chats,
+            on_confirm=self._start_selected_export,
+            on_refresh=lambda keep: self._load_chat_list(
+                self.db_dir_var.get().strip() or None, keep
+            ),
+            selected=keep,
+        )
+
+    def _start_selected_export(self, usernames):
+        ranges_ok, ranges = self._read_time_ranges()
+        if not ranges_ok:
+            return
+        if not is_wechat_running():
+            self._warn_wechat_not_running()
+            return
+
+        transcribe_voices = self.transcribe_var.get()
+        if transcribe_voices:
+            self.voices_var.set(True)
+
+        self.pending_all = False
+        self.pending_selection = list(usernames)
+        if not self._check_media_ready(transcribe_voices):
+            return
+
+        self._begin_export()
+        self.log(f"开始导出选中的 {len(usernames)} 个聊天…")
+        self._log_time_ranges(ranges)
+        threading.Thread(
+            target=self.worker_selected,
+            args=(
+                list(usernames),
+                self.out_var.get().strip() or str(app_dir() / "exports"),
+                self.images_var.get(),
+                self.files_var.get(),
+                self.voices_var.get(),
+                self.videos_var.get(),
+                transcribe_voices,
+                self.db_dir_var.get().strip() or None,
+                ranges,
+            ),
+            daemon=True,
+        ).start()
+
+    def worker_selected(
+        self,
+        usernames,
+        outdir,
+        export_images,
+        export_files,
+        export_voices,
+        export_videos,
+        transcribe_voices,
+        db_dir,
+        time_ranges=None,
+    ):
+        try:
+            result = export_all_chats(
+                outdir,
+                progress=lambda m: self.q.put(("log", m)),
+                export_images=export_images,
+                export_files=export_files,
+                export_voices=export_voices,
+                export_videos=export_videos,
+                transcribe_voices=transcribe_voices,
+                db_dir=db_dir,
+                time_ranges=time_ranges,
+                usernames=usernames,
+            )
+            self.q.put(("all_done", result))
+        except Exception as exc:
+            self.q.put(("error", f"{type(exc).__name__}: {exc}"))
 
     def install_asr_worker(self):
         try:
@@ -502,6 +692,7 @@ class App(tk.Tk):
         export_videos,
         transcribe_voices,
         db_dir,
+        time_ranges=None,
     ):
         try:
             result = export_chat(
@@ -514,6 +705,7 @@ class App(tk.Tk):
                 export_videos=export_videos,
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
+                time_ranges=time_ranges,
             )
             self.q.put(("done", result))
         except Exception as e:
@@ -528,6 +720,7 @@ class App(tk.Tk):
         export_videos,
         transcribe_voices,
         db_dir,
+        time_ranges=None,
     ):
         try:
             result = export_all_chats(
@@ -539,6 +732,7 @@ class App(tk.Tk):
                 export_videos=export_videos,
                 transcribe_voices=transcribe_voices,
                 db_dir=db_dir,
+                time_ranges=time_ranges,
             )
             self.q.put(("all_done", result))
         except Exception as exc:
@@ -556,6 +750,7 @@ class App(tk.Tk):
                     self.log(f"输出：{payload['output_dir']}")
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.clear_cache_btn.configure(state="normal")
                     self.open_btn.configure(state="normal")
                     self.preview_btn.configure(state="normal")
@@ -634,9 +829,15 @@ class App(tk.Tk):
                         if cleanup_ok
                         else messagebox.showwarning
                     )
+                    selected_mode = payload.get("selection") == "selected"
+                    not_found = payload.get("not_found") or []
+                    if not_found:
+                        unresolved_note += (
+                            f"\n选中但无法导出：{len(not_found)}（原因见总索引）"
+                        )
                     show_result(
                         APP_TITLE,
-                        "全部聊天导出完成。\n\n"
+                        ("选中聊天导出完成。\n\n" if selected_mode else "全部聊天导出完成。\n\n") +
                         f"可可靠识别会话：{payload['discovered_total']}\n"
                         f"本次处理：{payload['selected_total']}\n"
                         f"成功：{payload['exported']}\n"
@@ -647,9 +848,32 @@ class App(tk.Tk):
                         f"总索引：\n{payload['index_md']}"
                         f"{cleanup_note}",
                     )
+                elif kind == "chats_listed":
+                    db_dir, result, keep = payload
+                    self._set_export_buttons("normal")
+                    self.clear_cache_btn.configure(state="normal")
+                    self._chat_list = {"db_dir": db_dir, "chats": result["chats"]}
+                    unresolved = result.get("unresolved_message_tables") or 0
+                    if unresolved:
+                        self.log(f"另有 {unresolved} 个消息表无法可靠识别身份，不在列表中。")
+                    if not result.get("sensitive_cache_cleanup", True):
+                        error = result.get("sensitive_cache_cleanup_error")
+                        messagebox.showwarning(
+                            APP_TITLE,
+                            "读取聊天列表后，敏感临时缓存自动清理失败。\n"
+                            "请点击“清除敏感缓存”重试。"
+                            + (f"\n\n详细信息：{error}" if error else ""),
+                        )
+                    self._open_picker(result["chats"], keep)
+                elif kind == "chats_list_error":
+                    self._set_export_buttons("normal")
+                    self.clear_cache_btn.configure(state="normal")
+                    self.log("读取聊天列表失败：" + payload)
+                    messagebox.showerror(APP_TITLE, "读取聊天列表失败：\n\n" + payload)
                 elif kind == "cache_cleared":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.clear_cache_btn.configure(state="normal")
                     removed = payload.get("removed") or []
                     failed = payload.get("failed") or []
@@ -680,6 +904,7 @@ class App(tk.Tk):
                 elif kind == "cache_clear_error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.clear_cache_btn.configure(state="normal")
                     self.log("敏感缓存清理失败：" + payload)
                     messagebox.showerror(
@@ -689,6 +914,7 @@ class App(tk.Tk):
                 elif kind == "asr_installed":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.log("本地语音识别模型安装完成。")
                     messagebox.showinfo(
                         APP_TITLE,
@@ -698,15 +924,21 @@ class App(tk.Tk):
                 elif kind == "rust_silk_installed":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.log("rust-silk 安装完成，继续导出。")
-                    resume = (
-                        self.start_export_all if self.pending_all
-                        else self.start_export
-                    )
-                    self.after(0, resume)
+                    if self.pending_selection:
+                        selection = list(self.pending_selection)
+                        self.after(0, lambda: self._start_selected_export(selection))
+                    else:
+                        resume = (
+                            self.start_export_all if self.pending_all
+                            else self.start_export
+                        )
+                        self.after(0, resume)
                 elif kind == "rust_silk_error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.log("rust-silk 安装失败：" + payload)
                     messagebox.showerror(
                         APP_TITLE,
@@ -715,6 +947,7 @@ class App(tk.Tk):
                 elif kind == "asr_error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.log("本地语音识别模型安装失败：" + payload)
                     messagebox.showerror(
                         APP_TITLE,
@@ -723,6 +956,7 @@ class App(tk.Tk):
                 elif kind == "error":
                     self.export_btn.configure(state="normal")
                     self.export_all_btn.configure(state="normal")
+                    self.multi_btn.configure(state="normal")
                     self.clear_cache_btn.configure(state="normal")
                     self.log("导出失败：" + payload)
                     messagebox.showerror(

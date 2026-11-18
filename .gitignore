@@ -25,3 +25,9 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 真实环境测试的输出（含真实聊天导出，不要提交）
+tools/real_env_check/private/
+tools/real_env_check/report.json
+tools/real_env_check/gui_report.json
+tools/real_env_check/*.log

@@ -7,12 +7,19 @@ from exporter_core import (
     export_chat,
     install_local_asr_model,
     install_rust_silk,
+    list_chats,
 )
+from time_ranges import parse_time_ranges
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="微信聊天信息导出给大模型")
-    p.add_argument("name", nargs="?", help="好友备注/昵称或群名")
+    p.add_argument(
+        "names",
+        nargs="*",
+        metavar="name",
+        help="好友备注/昵称或群名；写多个即一次导出多个聊天（多选导出）",
+    )
     p.add_argument("--out", default="exports")
     p.add_argument(
         "--images",
@@ -77,7 +84,77 @@ if __name__ == "__main__":
             "默认自动探测；数据目录被自行迁移过、或自动探测读到错误副本时指定。"
         ),
     )
+    p.add_argument(
+        "--chats-file",
+        default=None,
+        metavar="文件",
+        help="UTF-8 文本文件，每行一个要导出的聊天（备注/昵称/群名，# 开头为注释），与命令行里的名字合并",
+    )
+    p.add_argument(
+        "--list-chats",
+        action="store_true",
+        help="列出本机可导出的私聊和群聊（名称、类型、最近消息时间）后退出",
+    )
+    p.add_argument(
+        "--since",
+        default=None,
+        metavar="开始",
+        help="开始日期/时间（含），如 2025-03-01 或 \"2025-03-01 14:00\"；可单独用或配合 --until",
+    )
+    p.add_argument(
+        "--until",
+        default=None,
+        metavar="结束",
+        help="结束日期/时间（含），如 2025-03-05 或 \"2025-03-05 18:30\"；可单独用或配合 --since",
+    )
+    p.add_argument(
+        "--range",
+        dest="ranges",
+        action="append",
+        default=[],
+        metavar="时间段",
+        help=(
+            "一个时间段，如 \"2025-03-01 14:00 ~ 16:30\"；可重复多次表示多个不连续时间段，"
+            "与 --since/--until、--ranges-file 合并使用"
+        ),
+    )
+    p.add_argument(
+        "--ranges-file",
+        default=None,
+        metavar="文件",
+        help="UTF-8 文本文件，每行一个时间段（# 开头为注释），适合大量不连续时间段",
+    )
     a = p.parse_args()
+
+    names = [n.strip() for n in a.names if n and n.strip()]
+    if a.chats_file:
+        try:
+            with open(a.chats_file, encoding="utf-8-sig") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        names.append(line)
+        except OSError as exc:
+            p.error(f"无法读取 --chats-file：{exc}")
+    names = list(dict.fromkeys(names))
+
+    range_specs = list(a.ranges)
+    if a.since or a.until:
+        range_specs.append(f"{a.since or ''} ~ {a.until or ''}")
+    if a.ranges_file:
+        try:
+            with open(a.ranges_file, encoding="utf-8-sig") as fh:
+                range_specs.append(fh.read())
+        except OSError as exc:
+            p.error(f"无法读取 --ranges-file：{exc}")
+    try:
+        time_ranges = parse_time_ranges(range_specs)
+    except ValueError as exc:
+        p.error(str(exc))
+    if time_ranges:
+        print(f"导出时间段（合并后共 {len(time_ranges)} 段）：")
+        for index, item in enumerate(time_ranges, 1):
+            print(f"  {index}. {item.label}")
 
     if a.limit is not None and a.limit <= 0:
         p.error("--limit 必须是正整数。")
@@ -107,9 +184,20 @@ if __name__ == "__main__":
                 )
             raise SystemExit(1)
         raise SystemExit(0)
-    if a.export_all:
-        if a.name:
-            print(f"注意：已指定 --all，忽略会话关键词“{a.name}”。")
+    if a.list_chats:
+        listing = list_chats(db_dir=a.db_dir, progress=print)
+        for item in listing["chats"]:
+            kind = "群聊" if item["is_group"] else "私聊"
+            print(f"{kind}\t{item['last_time_text'] or '—'}\t{item['name']}")
+        if not listing["sensitive_cache_cleanup"]:
+            print("敏感临时缓存自动清理失败：" + str(listing.get("sensitive_cache_cleanup_error")))
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    multi = len(names) > 1 and not a.export_all
+    if a.export_all or multi:
+        if a.export_all and names:
+            print(f"注意：已指定 --all，忽略会话关键词：{'、'.join(names)}")
         result = export_all_chats(
             a.out,
             progress=print,
@@ -120,6 +208,8 @@ if __name__ == "__main__":
             transcribe_voices=a.transcribe_voices,
             db_dir=a.db_dir,
             limit=a.limit,
+            time_ranges=time_ranges,
+            keywords=names if multi else None,
         )
         print(
             f"可可靠识别会话 {result['discovered_total']}，"
@@ -132,6 +222,8 @@ if __name__ == "__main__":
                 f"另有 {result['unresolved_message_tables']} 个消息表无法可靠反查身份，"
                 "已跳过而不是猜测。"
             )
+        for item in result.get("not_found") or []:
+            print(f"选中但无法导出：{item['query']}（{item['reason']}）")
         print("输出目录：" + result["output_dir"])
         print("总索引：" + result["index_md"])
         if not result["sensitive_cache_cleanup"]:
@@ -140,9 +232,9 @@ if __name__ == "__main__":
                 + str(result.get("sensitive_cache_cleanup_error"))
             )
             raise SystemExit(1)
-        raise SystemExit(1 if result["failed"] else 0)
+        raise SystemExit(1 if (result["failed"] or result.get("not_found")) else 0)
 
-    if not a.name:
+    if not names:
         p.error(
             "请提供好友备注/昵称或群名；或用 --all 导出全部聊天；"
             "或使用 --install-asr / --install-rust-silk / "
@@ -150,7 +242,7 @@ if __name__ == "__main__":
         )
 
     result = export_chat(
-        a.name,
+        names[0],
         a.out,
         progress=print,
         export_images=(a.images or a.media),
@@ -159,5 +251,6 @@ if __name__ == "__main__":
         export_videos=(a.videos or a.media),
         transcribe_voices=a.transcribe_voices,
         db_dir=a.db_dir,
+        time_ranges=time_ranges,
     )
     print(result)
